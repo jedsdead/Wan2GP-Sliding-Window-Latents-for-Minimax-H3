@@ -4,7 +4,7 @@ A Wan2GP (WanGP) extension plugin that carries MiniMax H3 latents across
 sliding windows instead of re-encoding the previous window's decoded pixels,
 removing one VAE decode/encode round trip per window.
 
-Version 1.0.0 · MIT · built and verified against Wan2GP `362c346` (7 Sep 2026)
+Version 1.0.1 · MIT · built and verified against Wan2GP `362c346` (7 Sep 2026)
 
 Video and audio latent carry are on by default. Colour consistency is
 experimental and off by default. Do not run this alongside the Sliding Window
@@ -230,9 +230,31 @@ A line beginning `BUG:` is not a fallback and should not be read as one.
 
 Same shape as the measurement needs, and each one discards rather than caps.
 
-- **Scene change** — past `SWL_COLOUR_SCENE` a difference is read as a cut,
-  not drift, and the window is left alone. Capping and applying it anyway
-  would drag a new scene bodily toward the grade of the old one.
+- **Scene change at the join** — past `SWL_COLOUR_SCENE` a difference between
+  the reference and this window's opening is read as a cut, not drift, and the
+  window is left alone. Capping and applying it anyway would drag a new scene
+  bodily toward the grade of the old one.
+- **Cut inside the window** — the correction is measured between the reference
+  and this window's *opening* frames, because those are the two things meant to
+  be continuous, but it is applied to the window's *closing* latents. A cut
+  part way through puts the measurement and its target on opposite sides of it:
+  everything after the cut belongs to a scene the reference never saw, and the
+  carried block is entirely on that side. So the window's own head is compared
+  against its own tail, and beyond the same threshold the correction is
+  withheld.
+
+  Unlike a pixel correction there is no partial version available. The Sliding
+  Window Anchor plugin can find the cut and correct only up to it, leaving the
+  seam on the cut where nothing can be seen; here the unit being corrected is a
+  single block of tail latents, so it is valid for the tail or it is not.
+
+  Comparing head against tail is sufficient rather than a full cut detector: a
+  cut that does not change the grade needs no guarding, and one that does shows
+  up in these statistics. A deliberate slow lighting change will not trip it
+  either, since drift runs around a percent per window against a 0.06 default.
+  A hard cut between very differently lit shots *will*, even within one scene —
+  a wide of a dark terrace to a face lit by firelight can exceed it. That is
+  the conservative direction, and `SWL_COLOUR_SCENE` tunes it.
 - **Noise floor** — the same statistics are measured between two interior
   groups of the *same* window, where there is no join and the true answer is
   no change. Anything at the join not clearly larger than that wobble is held

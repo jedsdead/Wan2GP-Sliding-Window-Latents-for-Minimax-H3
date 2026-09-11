@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.1
+- Colour consistency now checks that a window is uniform before correcting it.
+  The correction is measured at the window's opening and applied to its closing
+  latents, so a cut part way through put the measurement and its target on
+  opposite sides of it and the carried block was corrected toward a grade its
+  own scene never had. The window's head is now compared against its own tail
+  and the correction is withheld beyond `SWL_COLOUR_SCENE`.
+
 ## 1.0.0
 - First release.
 - Install now preflights every patch target and the packing constants, and

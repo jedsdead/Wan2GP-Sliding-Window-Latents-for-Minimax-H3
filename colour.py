@@ -200,6 +200,38 @@ def measure(reference, current, noise=None, strength=1.0,
 # the collapse into latent space
 # --------------------------------------------------------------------------
 
+def within_window_change(head, tail, scene_threshold=0.06):
+    """Is a window uniform enough for a head measurement to describe its tail?
+
+    The correction is measured between the reference - the previous window's
+    tail - and this window's opening frames, because those are the two things
+    that are supposed to be continuous. But in `latents` scope it is applied to
+    this window's *closing* latents, and in `both` scope to the whole window.
+
+    So a cut part way through a window puts the measurement and its target on
+    opposite sides of it. Everything after the cut belongs to a scene the
+    reference never saw and has nothing valid to be corrected toward, and the
+    carried block is entirely on that side. Refuse rather than apply: unlike a
+    pixel correction there is no partial version available, since the unit
+    being corrected is the single block of tail latents.
+
+    Comparing the window's own head against its own tail is enough. A cut that
+    does not change the grade needs no guarding, and one that does shows up
+    here. A slow deliberate lighting change will not trip it - drift runs
+    around a percent per window against a 0.06 default.
+
+    Returns (ok, detail).
+    """
+    luma = float(abs(head["mean"][0] - tail["mean"][0]))
+    chroma = float(np.abs(np.asarray(head["mean"][1:]) - np.asarray(tail["mean"][1:])).max())
+    if max(luma, chroma) > scene_threshold:
+        return False, (f"window is not uniform (head to tail luma {luma:.4f}, "
+                       f"chroma {chroma:.4f} > {scene_threshold}); a cut inside "
+                       f"the window puts the measurement and the latents it "
+                       f"would correct on opposite sides of it")
+    return True, None
+
+
 def compose(total, new, max_gain=0.25, max_offset=0.25):
     """Accumulate a correction onto the running total, in Y'CbCr.
 

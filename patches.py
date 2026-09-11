@@ -330,7 +330,7 @@ class _State:
 
 STATE = _State()
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 _PACKING = None                     # packing module, resolved by _preflight()
 
@@ -454,6 +454,19 @@ def _measure_colour(decoded):
     tail = _colour_stats(decoded, max(decoded.shape[2] - _COLOUR_SPAN, 0),
                          decoded.shape[2])
     if head is None or tail is None:
+        return decoded
+
+    # A cut inside this window would put the head measurement and the tail
+    # latents it is applied to on opposite sides of it.
+    uniform, detail = colour.within_window_change(head, tail, CONFIG.colour_scene)
+    if not uniform:
+        _log(f"colour: {detail}, leaving this window alone")
+        STATE.colour_correction = STATE.colour_step = None
+        # The next window continues from the post-cut look, so that is what it
+        # should be matched against.
+        STATE.colour_reference = tail
+        if STATE.colour_first is None:
+            STATE.colour_first = head
         return decoded
 
     if STATE.colour_first is None:

@@ -169,6 +169,35 @@ check("axis toggles isolate one axis",
       luma_only["gain"] == [1.0, 1.0, 1.0] and luma_only["offset"][1:] == [0.0, 0.0])
 print()
 
+# ------------------------------------------- a cut inside the window ----
+print("a cut inside the window withholds the correction")
+
+uniform_head = colour.ycbcr_stats(before)
+uniform_tail = colour.ycbcr_stats(before * 0.995 + 0.004)      # ordinary drift
+ok, detail = colour.within_window_change(uniform_head, uniform_tail)
+check("ordinary within-window drift is allowed through", ok, detail or "")
+
+for label, factor, lift in (("darker scene", 0.55, 0.0),
+                            ("brighter scene", 1.0, 0.20),
+                            ("colour shift", 1.0, 0.0)):
+    shifted = before * factor + lift
+    if label == "colour shift":
+        shifted = before + np.array([0.10, -0.06, -0.04])
+    cut_tail = colour.ycbcr_stats(shifted)
+    ok, detail = colour.within_window_change(uniform_head, cut_tail)
+    check(f"{label:16s} refused", not ok, (detail or "")[:58])
+
+# A shot change that does not alter the grade needs no guarding.
+same_grade = colour.ycbcr_stats(before[rng.permutation(before.shape[0])])
+ok, _ = colour.within_window_change(uniform_head, same_grade)
+check("a cut that does not change the grade is not refused", ok)
+
+# The threshold is what separates them, and it is configurable.
+tight = colour.within_window_change(uniform_head, uniform_tail,
+                                    scene_threshold=0.0001)[0]
+check("a tighter threshold refuses more", not tight)
+print()
+
 # ------------------------------- pixel path and latent path must agree ----
 print("the two correction paths agree")
 
