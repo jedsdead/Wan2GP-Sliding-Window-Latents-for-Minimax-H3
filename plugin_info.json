@@ -1,0 +1,9 @@
+{
+  "name": "Sliding Window Latents",
+  "type": "extension",
+  "version": "1.0.0",
+  "author": "JedsDeadBaby",
+  "date": "2026-09-11",
+  "url": "https://github.com/JedsDeadBaby/wan2gp-sliding-window-latents",
+  "description": "Reuses the previous sliding window's own latents as MiniMax H3 history conditioning, removing one VAE decode/encode round trip per window. Carries only within a video: a queued job's first window re-encodes."
+}
