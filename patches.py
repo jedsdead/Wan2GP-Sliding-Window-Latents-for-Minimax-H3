@@ -1241,8 +1241,9 @@ def _preflight():
         if channels != 2:
             problems.append(f"MINIMAX_H3_AUDIO_CHANNELS is {channels}, expected 2")
 
-    if not callable(getattr(MiniMaxH3Pipeline, "video_latent_frames", None)):
-        problems.append("MiniMaxH3Pipeline.video_latent_frames is missing; the "
+    from models.minimax_h3 import pipeline as _pipeline_module
+    if not callable(getattr(_pipeline_module, "video_latent_frames", None)):
+        problems.append("pipeline.video_latent_frames is missing; the "
                         "latent count cannot be checked against expectation")
 
     available = {}
