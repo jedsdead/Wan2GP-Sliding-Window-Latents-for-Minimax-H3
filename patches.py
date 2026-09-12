@@ -100,6 +100,7 @@ changes behaviour live and anything saved from it wins over the environment.
                             Also costs one encode per window       (default 0)
 """
 
+import atexit
 import os
 import threading
 
@@ -169,10 +170,18 @@ class _Config:
                              .strip().lower())
         if self.colour_scope not in ("latents", "both"):
             self.colour_scope = "latents"
-        self.colour_match = (os.environ.get("SWL_COLOUR_MATCH", "previous")
+        # `first` by default.  `previous` matches each window to the one
+        # before it, but that reference is itself uncorrected and drifting, so
+        # it only slows the drift instead of holding it - and the more of a
+        # window's error accrues after its head (the part that gets measured)
+        # rather than before it, the less it recovers.  `first` composes the
+        # residual gap onto the running total every window, which converges on
+        # the anchor wherever in the window the measurement lands.
+        # tests/test_colour_anchor.py measures both.
+        self.colour_match = (os.environ.get("SWL_COLOUR_MATCH", "first")
                              .strip().lower())
         if self.colour_match not in ("previous", "first"):
-            self.colour_match = "previous"
+            self.colour_match = "first"
         # Offsets lean on the linear latent-to-RGB map lightly; gains lean on
         # it harder.  See colour.py.  Gains are opt in.
         axes = os.environ.get("SWL_COLOUR_AXES", "brightness,cast")
@@ -306,7 +315,8 @@ class _State:
         self.colour_seeded = False       # reference came from a continuation
         self.last_message = "idle"
         self.stats = {"engaged": 0, "fell_back": 0, "audio_engaged": 0,
-                      "colour_applied": 0}
+                      "colour_applied": 0, "colour_measured": 0,
+                      "colour_noop": 0, "colour_refused": 0}
 
     def invalidate(self, reason):
         if self.latents is not None:
@@ -443,6 +453,37 @@ def _colour_noise(decoded):
             "std": right["std"] - left["std"]}
 
 
+_COLOUR_MAP_REPORTED = False
+
+
+def _check_colour_map():
+    """Say once which latent-to-RGB map the correction is being built on.
+
+    load_factors() falls back to the embedded copy when Wan2GP's own map
+    cannot be read, and returns the reason rather than raising.  That fallback
+    is silent, and a correction derived from the wrong basis is not obviously
+    wrong - it is a plausible-looking grade shift in the wrong direction.
+    Worth one line at the top of a run.
+    """
+    global _COLOUR_MAP_REPORTED
+    if _COLOUR_MAP_REPORTED:
+        return
+    _COLOUR_MAP_REPORTED = True
+    try:
+        from . import colour
+        _, _, source = colour.load_factors()
+        if source == "wan2gp":
+            _log("colour: using Wan2GP's own latent-to-RGB map")
+        else:
+            _log(f"colour: WARNING - falling back to the embedded latent-to-RGB "
+                 f"map ({source}). Corrections are built on a copy rather than "
+                 f"this build's own map; if the two differ the grade will be "
+                 f"pushed the wrong way. Check that shared/RGB_factors.py still "
+                 f"exposes get_rgb_factors('minimax_h3').")
+    except Exception as error:
+        _log(f"colour: could not resolve the latent-to-RGB map: {error!r}")
+
+
 def _measure_colour(decoded):
     """Compare this window's opening against the reference, and set up (A, b).
 
@@ -450,6 +491,7 @@ def _measure_colour(decoded):
     and the previous window's statistics exist at once.
     """
     from . import colour
+    _check_colour_map()
     head = _colour_stats(decoded, 0, _COLOUR_SPAN)
     tail = _colour_stats(decoded, max(decoded.shape[2] - _COLOUR_SPAN, 0),
                          decoded.shape[2])
@@ -483,9 +525,19 @@ def _measure_colour(decoded):
             max_correction=CONFIG.colour_max,
             axes=CONFIG.colour_axes)
         if gain is None:
+            STATE.stats["colour_refused"] += 1
             _log(f"colour: {report['rejected']}, leaving this window alone")
         elif report["is_noop"]:
-            _log("colour: measured drift is inside the noise floor, no correction")
+            # Say how close it came.  "Inside the noise floor" with no numbers
+            # reads identically whether the drift was a hair under the floor or
+            # a hundredth of it, and those call for opposite responses.
+            STATE.stats["colour_noop"] += 1
+            floor = report.get("noise", {}).get("offset")
+            _log(f"colour: drift is inside the noise floor, no correction "
+                 f"(luma {report['luma_step']:.4f}, chroma "
+                 f"{report['chroma_step']:.4f}"
+                 + (f"; floor {max(floor):.4f}" if floor else "")
+                 + ")")
         elif CONFIG.colour_scope == "both":
             # The window itself is rewritten, so the reference the next window
             # measures against is corrected too and the loop closes on its own
@@ -493,6 +545,7 @@ def _measure_colour(decoded):
             # to be cached, which is what keeps conditioning and video from
             # drifting apart.
             decoded = _correct_pixels(decoded, gain, offset)
+            STATE.stats["colour_measured"] += 1
             STATE.colour_step = colour.latent_correction(gain, offset)
             tail = _colour_stats(decoded, max(decoded.shape[2] - _COLOUR_SPAN, 0),
                                  decoded.shape[2])
@@ -503,6 +556,7 @@ def _measure_colour(decoded):
             # Accumulated, not replaced.  The video is not rewritten, so the
             # reference keeps moving; a per-window correction would fire on
             # alternate windows and let the drift back in at half rate.
+            STATE.stats["colour_measured"] += 1
             STATE.colour_total = colour.compose(STATE.colour_total, (gain, offset))
             _log(f"colour: step gain {np.round(gain, 4).tolist()} "
                  f"offset {np.round(offset, 4).tolist()}  ->  total gain "
@@ -716,6 +770,53 @@ def _patched_encode_audio(self, waveform):
     return cached[..., -wanted:].to(dtype=native.dtype).clone()
 
 
+def _summarise(reason):
+    """Report what the run actually did, once, at a job boundary or at exit.
+
+    STATE.stats has always been kept, but only the Gradio panel ever read it -
+    so a headless run (wgp.py --process) and anyone reading the console had no
+    way to tell an engaged plugin from an inert one without counting log lines
+    by eye.  That is the same blind spot that let a dead colour path look
+    healthy for a release: per-window lines scroll past, totals do not.
+    """
+    stats = STATE.stats
+    windows = stats["engaged"] + stats["fell_back"]
+    colour_events = (stats["colour_applied"] + stats["colour_measured"]
+                     + stats["colour_noop"] + stats["colour_refused"])
+    if not windows and not colour_events:
+        return
+    parts = ([f"{stats['engaged']}/{windows} windows carried",
+              f"{stats['fell_back']} re-encoded"] if windows
+             else ["no windows carried"])
+    if CONFIG.audio:
+        parts.append(f"{stats['audio_engaged']} audio carried")
+    if CONFIG.colour:
+        parts.append(f"colour {stats['colour_measured']} measured"
+                     f"/{stats['colour_applied']} applied"
+                     f"/{stats['colour_noop']} inside noise floor"
+                     f"/{stats['colour_refused']} refused")
+    _log(f"summary ({reason}): " + ", ".join(parts))
+
+    # A verdict that names the cause.  "Nothing was corrected" has three very
+    # different explanations and only one of them means turn the feature off.
+    if CONFIG.colour:
+        if stats["colour_measured"] and not stats["colour_applied"] and not windows:
+            _log("colour: corrections were measured but none reached anything - "
+                 "no window carried, and in latents scope the correction is "
+                 "applied to carried latents. Fix the carry first; the colour "
+                 "setting is not the problem.")
+        elif stats["colour_refused"] and not stats["colour_measured"]:
+            _log("colour: every window was refused as a scene change. If this "
+                 "material really is one continuous shot, SWL_COLOUR_SCENE is "
+                 "set too tight.")
+        elif stats["colour_noop"] and not stats["colour_measured"]:
+            _log("colour: drift stayed inside the noise floor all run - latent "
+                 "carry has already removed it on this material, so the feature "
+                 "is not earning its place here. Turn it off.")
+    for key in stats:
+        stats[key] = 0
+
+
 # --------------------------------------------------------------------------
 # 2. window bookkeeping
 # --------------------------------------------------------------------------
@@ -843,6 +944,7 @@ def _patched_generate(self, *args, **kwargs):
             with STATE.lock:
                 STATE.invalidate("caller did not report window_no")
     elif STATE.window_no <= 1:
+        _summarise("previous job")
         with STATE.lock:
             STATE.invalidate(f"window {STATE.window_no} starts a new video")
 
@@ -1290,6 +1392,9 @@ def install():
 
     _ORIGINAL_OWNERS.update({key: (owner, attribute)
                              for key, (owner, attribute) in available.items()})
+    # A job boundary summarises the job before it, so the last one of a run
+    # would never be reported - which for `wgp.py --process` is every job.
+    atexit.register(_summarise, "at exit")
     _log(f"installed v{VERSION} (enable={CONFIG.enable}, fix_coords={CONFIG.fix_coords}, "
          f"latents={CONFIG.latents or _DEFAULT_LATENTS}, audio={CONFIG.audio}, "
          f"colour={CONFIG.colour}, diagnose={CONFIG.diagnose}, "

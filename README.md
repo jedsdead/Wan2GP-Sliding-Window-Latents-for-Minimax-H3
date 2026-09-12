@@ -106,7 +106,7 @@ Environment variables, read once when the plugin loads.
 | `SWL_COLOUR` | `0` | correct grade drift on the carried latents |
 | `SWL_COLOUR_AXES` | `brightness,cast` | which of `brightness`, `contrast`, `saturation`, `cast` to correct |
 | `SWL_COLOUR_SCOPE` | `latents` | `latents` corrects only the conditioning; `both` also rewrites the window |
-| `SWL_COLOUR_MATCH` | `previous` | `previous` window or `first` window as the reference |
+| `SWL_COLOUR_MATCH` | `first` | `previous` window or `first` window as the reference. `first` holds the grade; `previous` only slows the drift — see below |
 | `SWL_COLOUR_STRENGTH` | `1.0` | how much of the measured difference to remove |
 | `SWL_COLOUR_SCENE` | `0.06` | past this, a difference is read as a cut and the window is skipped |
 | `SWL_COLOUR_MAX` | `0.15` | ceiling on the accumulated correction |
@@ -216,13 +216,84 @@ The residual first step is the one-window lag: nothing can be measured until
 a second window exists. The total is clamped rather than the step, since it
 is the total that reaches the model.
 
+### Which reference
+
+`SWL_COLOUR_MATCH` decides what a window is corrected toward, and it matters
+more than it looks.
+
+`previous` matches each window to the one before it. But in `latents` scope the
+video is never rewritten, so that reference is itself uncorrected and still
+drifting — the correction is chasing a moving target. `first` matches every
+window to the opening one and composes the residual gap onto the running total,
+which is an integral term: it converges on the anchor regardless of where in the
+window the measurement lands.
+
+That last part is the catch. The correction is measured at a window's *head* but
+applied to its *tail*, and the window's own re-synthesis error accrues across it,
+so the two are not the same grade. The more of that error lands after the head,
+the less of it `previous` ever sees. `tests/test_colour_anchor.py` sweeps that
+split — `head_frac` is how much of the window's drift has accrued by the time the
+head is measured, and the figures are the drift remaining as a fraction of an
+uncorrected run:
+
+```
+head_frac    previous    first
+  1.00         14.5%     14.5%
+  0.75         36.2%     14.5%
+  0.45         61.9%     14.5%
+  0.20         83.2%     14.5%
+```
+
+`head_frac = 1.00` is a uniform window — head and tail at the same grade — which
+is the model `tests/test_colour_latents.py` uses, and there the two policies are
+indistinguishable. That is why `previous` looked sufficient. On any window that
+drifts across itself it is not, and 14.5% is the one-window lag floor that
+nothing can beat.
+
+The trade: `first` pins the whole generation to window one, so a deliberate,
+gradual grade change over a long video is something it will fight rather than
+follow. `SWL_COLOUR_MAX` bounds how hard. A hard cut is discarded by the scene
+guard under either setting. If you want the grade to be free to evolve, set
+`previous` and accept that it holds less.
+
 ### Is it doing anything?
 
-Watch the console. Each window logs either the correction it applied, or
-`measured drift is inside the noise floor, no correction`. If it reports the
-noise floor on window after window, latent carry has already removed enough of
-the drift that there is nothing left to correct, and the feature is not earning
-its place on that material - turn it off.
+Watch the console. Each window logs either the correction it applied, or the
+drift it measured and the noise floor that drift lost to:
+
+```
+colour: using Wan2GP's own latent-to-RGB map
+colour: drift is inside the noise floor, no correction (luma 0.0031, chroma 0.0008; floor 0.0042)
+```
+
+The numbers matter for deciding what to do next. A drift a hair under the floor
+and one a hundredth of it read the same as a bare "inside the noise floor", and
+they call for opposite responses — nudge the material or the settings in the
+first case, turn the feature off in the second.
+
+The first line names which latent-to-RGB map the correction was built on.
+`load_factors()` falls back to the embedded copy when Wan2GP's own map cannot be
+read, and that fallback used to be silent; a correction derived from the wrong
+basis is not obviously wrong, it is a plausible-looking grade shift in the wrong
+direction.
+
+At the end of a job the summary gives a verdict:
+
+```
+summary (at exit): 3/3 windows carried, 0 re-encoded, colour 2 measured/2 applied/1 inside noise floor/0 refused
+```
+
+`measured` and `applied` are separate on purpose. In `latents` scope the
+correction is applied to *carried* latents, so a run where nothing carried will
+measure corrections that reach nothing — that is a carry problem wearing a
+colour problem's clothes, and the verdict says so rather than blaming the
+colour settings.
+
+Only one of the three ways to correct nothing means turn the feature off:
+
+- corrections measured but nothing carried → fix the carry first
+- every window refused as a scene change → `SWL_COLOUR_SCENE` is too tight
+- drift genuinely inside the floor → carry already removed it; turn it off
 
 A line beginning `BUG:` is not a fallback and should not be read as one.
 
