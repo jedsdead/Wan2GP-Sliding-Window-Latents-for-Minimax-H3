@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.2
+- Fixed: the plugin stayed inert on every build. `_preflight` looked for
+  `video_latent_frames` on `MiniMaxH3Pipeline`, but it is a module-level
+  function in `pipeline.py`, so the check could never pass and 1.0.0 and 1.0.1
+  declared every Wan2GP unpatchable - including the one they were written
+  against. Preflight now verifies pipeline helpers by performing the same
+  import the runtime path performs, so the two cannot drift apart.
+- `tests/test_install_table.py` now checks that every name imported from
+  `models.minimax_h3.*` anywhere in the plugin is also imported by
+  `_preflight`, and that no module-level name is probed on a class. It fails
+  on the 1.0.0 code.
+
 ## 1.0.1
 - Colour consistency now checks that a window is uniform before correcting it.
   The correction is measured at the window's opening and applied to its closing

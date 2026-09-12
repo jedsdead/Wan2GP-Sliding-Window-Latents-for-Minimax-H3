@@ -117,6 +117,51 @@ check("audio and Ref2VA are optional",
       f"optional {sorted(optional)}")
 print()
 
+print("preflight covers every Wan2GP name the runtime needs")
+
+
+def h3_imports(scope=None):
+    """(module, name) pairs imported from models.minimax_h3.* in `scope`."""
+    pairs = set()
+    tree = scope if scope is not None else TREE
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
+                "models.minimax_h3"):
+            for alias in node.names:
+                pairs.add((node.module, alias.name))
+    return pairs
+
+
+preflight = next((n for n in ast.walk(TREE)
+                  if isinstance(n, ast.FunctionDef) and n.name == "_preflight"), None)
+check("_preflight is defined", preflight is not None)
+
+if preflight is not None:
+    runtime = h3_imports() - h3_imports(preflight)
+    covered = h3_imports(preflight)
+    # Names the runtime imports from a module must be verified from that same
+    # module by preflight, not probed on a class.  v1.0.0 probed
+    # video_latent_frames on MiniMaxH3Pipeline, which never had it.
+    missing = {pair for pair in runtime if pair not in covered}
+    check("every name imported elsewhere is also imported by _preflight",
+          not missing, f"uncovered: {sorted(missing)}")
+
+    # And nothing in preflight may assert an attribute on a class when the
+    # runtime takes it from a module namespace.
+    module_names = {name for _, name in covered}
+    class_probes = set()
+    for node in ast.walk(preflight):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "getattr" and len(node.args) >= 2
+                and isinstance(node.args[0], ast.Name)
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[0].id[:1].isupper()):
+            class_probes.add((node.args[0].id, node.args[1].value))
+    conflicts = {p for p in class_probes if p[1] in module_names}
+    check("no module-level name is probed on a class", not conflicts,
+          f"conflicts: {sorted(conflicts)}")
+print()
+
 print("install/uninstall symmetry")
 src = SOURCE
 check("uninstall restores through _ORIGINAL_OWNERS",

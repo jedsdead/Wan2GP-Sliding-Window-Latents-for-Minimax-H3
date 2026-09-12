@@ -330,7 +330,7 @@ class _State:
 
 STATE = _State()
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 _PACKING = None                     # packing module, resolved by _preflight()
 
@@ -1241,9 +1241,22 @@ def _preflight():
         if channels != 2:
             problems.append(f"MINIMAX_H3_AUDIO_CHANNELS is {channels}, expected 2")
 
-    if not callable(getattr(MiniMaxH3Pipeline, "video_latent_frames", None)):
-        problems.append("MiniMaxH3Pipeline.video_latent_frames is missing; the "
-                        "latent count cannot be checked against expectation")
+    # Verified by performing the same imports the runtime path performs, rather
+    # than by probing for them somewhere.  v1.0.0 looked for
+    # video_latent_frames on MiniMaxH3Pipeline when it is a module-level
+    # function in pipeline.py, so the plugin declared every build unpatchable -
+    # including the one it was written against.  Mirroring the real import
+    # cannot drift from it that way.
+    try:
+        from models.minimax_h3.pipeline import _as_video, video_latent_frames
+    except Exception as error:
+        problems.append(f"pipeline helpers _as_video / video_latent_frames are "
+                        f"not importable ({error!r}); the latent count cannot be "
+                        f"checked against expectation")
+    else:
+        if not callable(video_latent_frames) or not callable(_as_video):
+            problems.append("pipeline._as_video / pipeline.video_latent_frames "
+                            "are not callable")
 
     available = {}
     for key, owner_name, attribute, required in _TARGETS:
