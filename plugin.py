@@ -25,14 +25,8 @@ DESCRIPTION = (
 )
 
 NOTE = (
-    "Do not run this alongside the Sliding Window Anchor plugin. The anchor "
-    "injects a frame at the same time coordinate that Wan2GP already pins the "
-    "previous window's final frame to, and that the carried latents also reach. "
-    "Two or three condition blocks asserting one instant makes the model hold on "
-    "it, which is the frozen frame at the join. Changing the carried latent count "
-    "does not help: the block always ends on the join frame, so 7, 12 and 17 all "
-    "reach it. The anchor's frame injection has been redundant since Wan2GP "
-    "added its own continuation pin; its colour matching is the part that is not."
+    "Use this or the Sliding Window Anchor plugin, not both — running them "
+    "together can add extra frames at the join."
 )
 
 # Anything the panel exposes.  Env vars still set the initial value; the saved
@@ -77,6 +71,16 @@ class SlidingWindowLatentsPlugin(WAN2GPPlugin):
                     value=patches.CONFIG.audio,
                     label="Carry audio latents",
                     info="Also replaces the continuation audio encode.",
+                )
+                audio_ctx_dd = gr.Dropdown(
+                    choices=[0.0, 0.5, 1.0, 2.0, 4.0],
+                    value=float(patches.CONFIG.audio_context),
+                    label="Audio context (seconds, experimental)",
+                    info="0 uses Wan2GP's window, which is derived from the video "
+                         "overlap — 0.75s at overlap 18. Longer gives the audio "
+                         "more history without changing the video overlap. Needs "
+                         "latent carry and the coordinate correction; the console "
+                         "reports what was carried.",
                 )
                 latents_dd = gr.Dropdown(
                     choices=[7, 12, 17],
@@ -147,15 +151,16 @@ class SlidingWindowLatentsPlugin(WAN2GPPlugin):
 
                 timer = gr.Timer(3)
 
-                controls = [enable_cb, audio_cb, latents_dd,
+                controls = [enable_cb, audio_cb, audio_ctx_dd, latents_dd,
                             coords_cb, moment_cb, diagnose_cb,
                             colour_cb, colour_axes_cb, colour_match_dd,
                             colour_strength_sl]
 
-                def _apply(enable, audio, carried, fix_coords, moment_match, diagnose,
+                def _apply(enable, audio, audio_context, carried, fix_coords, moment_match, diagnose,
                            colour, colour_axes, colour_match, colour_strength):
                     patches.CONFIG.enable = bool(enable)
                     patches.CONFIG.audio = bool(audio)
+                    patches.CONFIG.audio_context = float(audio_context)
                     patches.CONFIG.latents = int(carried)
                     patches.CONFIG.fix_coords = bool(fix_coords)
                     patches.CONFIG.moment_match = bool(moment_match)
@@ -229,6 +234,8 @@ class SlidingWindowLatentsPlugin(WAN2GPPlugin):
                     setattr(patches.CONFIG, name, bool(data[name]))
             if "latents" in data:
                 patches.CONFIG.latents = int(data["latents"])
+            if "audio_context" in data:
+                patches.CONFIG.audio_context = float(data["audio_context"])
             if "colour_axes" in data:
                 patches.CONFIG.colour_axes = tuple(data["colour_axes"])
             if "colour_match" in data:
@@ -243,6 +250,7 @@ class SlidingWindowLatentsPlugin(WAN2GPPlugin):
             os.makedirs(self.state_dir, exist_ok=True)
             payload = {name: bool(getattr(patches.CONFIG, name)) for name in TOGGLES}
             payload["latents"] = int(patches.CONFIG.latents or 7)
+            payload["audio_context"] = float(patches.CONFIG.audio_context)
             payload["colour_axes"] = list(patches.CONFIG.colour_axes)
             payload["colour_match"] = str(patches.CONFIG.colour_match)
             payload["colour_strength"] = float(patches.CONFIG.colour_strength)

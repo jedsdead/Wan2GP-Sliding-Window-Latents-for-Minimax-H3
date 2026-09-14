@@ -137,7 +137,15 @@ preflight = next((n for n in ast.walk(TREE)
 check("_preflight is defined", preflight is not None)
 
 if preflight is not None:
-    runtime = h3_imports() - h3_imports(preflight)
+    # Imports read through a helper with a documented fallback do not need to
+    # be verified by preflight, because their absence is survivable rather
+    # than disqualifying.  Each exemption needs a reason here.
+    EXEMPT = {
+        # _audio_latent_fps() falls back to 40, which is the rate implied by the
+        # autoencoder's 800-sample hop at 32 kHz.
+        ("models.minimax_h3.pipeline", "AUDIO_LATENT_FPS"),
+    }
+    runtime = h3_imports() - h3_imports(preflight) - EXEMPT
     covered = h3_imports(preflight)
     # Names the runtime imports from a module must be verified from that same
     # module by preflight, not probed on a class.  v1.0.0 probed

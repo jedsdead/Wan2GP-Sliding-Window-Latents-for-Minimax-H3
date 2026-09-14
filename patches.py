@@ -121,7 +121,12 @@ _ALIGN_DECISIVE = 0.6               # a rival offset must beat expected by this 
 _AUDIO_SAMPLE_RATE = 32000          # pipeline.AUDIO_SAMPLE_RATE
 _AUDIO_SIGNATURE_BINS = 32
 _AUDIO_SIGNATURE_SECONDS = 0.5
-_MAX_CACHED_AUDIO_LATENTS = 64      # 18 frames at 40 latent fps is ~30
+_MAX_CACHED_AUDIO_LATENTS = 192     # 18 frames at 40 latent fps is ~30; headroom for
+                                    # extended audio context up to ~4.8s
+# Wan2GP's audio autoencoder has a hop of 800 samples at 32 kHz, i.e. 40
+# latents/s (models/minimax_h3/components/audio_autoencoder.py).  Resolved from
+# the pipeline where available rather than assumed.
+_AUDIO_LATENT_FPS_FALLBACK = 40.0
 _CLIP_LENGTH = 17                   # H3 window quantum
 _COLOUR_AXES = ("brightness", "contrast", "saturation", "cast")
 _COLOUR_SPAN = 5                    # frames measured each side of a join
@@ -155,6 +160,15 @@ class _Config:
         self.audio = _flag("SWL_AUDIO", "1")
         self.diagnose = _flag("SWL_DIAGNOSE", "0")
         self.moment_match = _flag("SWL_MOMENT_MATCH", "0")
+        # Extended audio context, in seconds.  0 keeps Wan2GP's behaviour, where
+        # the audio window is derived from the video overlap and is therefore
+        # 0.75s at overlap 18 - ample for motion, short for sound.
+        try:
+            self.audio_context = float(os.environ.get("SWL_AUDIO_CONTEXT", "0"))
+        except ValueError:
+            self.audio_context = 0.0
+        if not 0.0 <= self.audio_context <= 4.0:
+            self.audio_context = 0.0
         try:
             self.audio_tolerance = float(os.environ.get("SWL_AUDIO_TOL", "0.15"))
         except ValueError:
@@ -279,6 +293,7 @@ class _State:
         self.latents = None
         self.signature = None
         self.signatures = None
+        self.audio_extra = 0
         self.source_generation = -1
         self.source_window_no = None
         self.usable = False
@@ -293,6 +308,7 @@ class _State:
         # audio side
         self.audio_latents = None
         self.audio_signature = None
+        self.audio_extra = 0             # extra carried audio latents this window
         self.audio_generation = -1
         self.audio_source_window_no = None
         self.audio_encode_calls = 0
@@ -330,7 +346,7 @@ class _State:
 
 STATE = _State()
 
-VERSION = "1.0.2"
+VERSION = "1.1"
 
 _PACKING = None                     # packing module, resolved by _preflight()
 
@@ -711,14 +727,68 @@ def _patched_encode_audio(self, waveform):
              f"{tuple(native.shape)})")
         return native
 
+    extra = _audio_extension(wanted, cached.shape[-1])
+    STATE.audio_extra = extra
+    total = wanted + extra
     STATE.stats["audio_engaged"] += 1
-    _log(f"carried {wanted} audio latents from the previous window")
-    return cached[..., -wanted:].to(dtype=native.dtype).clone()
+    if extra:
+        _log(f"carried {total} audio latents from the previous window "
+             f"({total / _audio_latent_fps():.2f}s context, {extra} beyond the "
+             f"native window of {wanted})")
+    else:
+        _log(f"carried {wanted} audio latents from the previous window")
+    return cached[..., -total:].to(dtype=native.dtype).clone()
 
 
 # --------------------------------------------------------------------------
 # 2. window bookkeeping
 # --------------------------------------------------------------------------
+
+def _audio_latent_fps():
+    try:
+        from models.minimax_h3.pipeline import AUDIO_LATENT_FPS
+        rate = float(AUDIO_LATENT_FPS)
+        return rate if rate > 0 else _AUDIO_LATENT_FPS_FALLBACK
+    except Exception:
+        return _AUDIO_LATENT_FPS_FALLBACK
+
+
+def _audio_extension(native_latents, cached_latents):
+    """How many audio latents to carry beyond what the native encode produced.
+
+    Wan2GP sizes the audio condition from the video overlap - `overlap_samples =
+    round(continuation_count / fps * AUDIO_SAMPLE_RATE)` - so at overlap 18 and
+    24 fps the model gets 0.75s of audio context.  That is generous for motion
+    continuity and short for sound: less than a bar at most tempos, and shorter
+    than many single spoken words.
+
+    Returning a longer tail gives the history block more to work with, but the
+    builder lays a history block *forward* from `float(text_len)`, so the extra
+    latents would run past `target_origin` and collide with the target audio.
+    _apply_origin_shift compensates by moving everything except the audio
+    history later by the same amount, which is only reached when the video carry
+    engaged and fix_coords is on - hence the gate here.
+    """
+    if CONFIG.audio_context <= 0:
+        return 0
+    if STATE.active_latents is None or not CONFIG.fix_coords:
+        _log("extended audio context needs the video carry and fix_coords; "
+             "using the native audio window for this window")
+        return 0
+    desired = int(round(CONFIG.audio_context * _audio_latent_fps()))
+    if desired <= int(native_latents):
+        _log(f"audio context of {CONFIG.audio_context:g}s is already covered by the "
+             f"native window ({int(native_latents)} latents, "
+             f"{int(native_latents) / _audio_latent_fps():.2f}s); nothing added")
+        return 0
+    extra = desired - int(native_latents)
+    available = max(0, int(cached_latents) - int(native_latents))
+    if extra > available:
+        _log(f"extended audio context trimmed to the cached tail "
+             f"({available} spare latents, wanted {extra})")
+        extra = available
+    return extra
+
 
 def _window_number(values):
     """wgp.py's 1-based window counter, or None if the caller did not send one.
@@ -825,6 +895,7 @@ def _patched_generate(self, *args, **kwargs):
     with STATE.lock:
         STATE.generation += 1
     STATE.active_latents = None
+    STATE.audio_extra = 0
     STATE.audio_encode_calls = 0
     STATE.plan = _plan_window(self, args, kwargs)
     STATE.window_no = STATE.plan.get("window_no")
@@ -933,6 +1004,9 @@ def _patched_add_video_history(self, video, visual_latents, keyframes):
     silently, so say so rather than let it pass.
     """
     STATE.active_latents = None
+    # Cleared per window: a stale value would shift the layout for a window
+    # whose audio fell back to the native encode.
+    STATE.audio_extra = 0
     if CONFIG.colour:
         try:
             _colour_seed(video)
@@ -1082,29 +1156,47 @@ def _apply_origin_shift(sequence, text_len, keyframe_anchors, audio_condition_an
         return sequence
 
     times = sequence.position_ids[:, 0]
-    # NEGATIVE.  The block is one frame LATER than the layout reserves for it,
-    # and a block's position is reported as (block_absolute - target_origin),
-    # so target_origin must move EARLIER to close the gap.  Raising it instead
-    # widens the skew from one frame to two.  tests/test_layout_contract.py
-    # pins this down.
-    delta = -_RESERVE_DEFICIT * _FRAME_RESCALE * float(video_time_scale)
+
+    # POSITIVE, and applied to the carried video history block alone.
+    #
+    # Only one relative offset needs changing: the carried block's content sits
+    # one frame later than the layout reserves for it, so the block must sit one
+    # frame later with respect to the target.  That can be done by moving the
+    # target earlier or by moving the block later, and the two are identical in
+    # relative terms - but not in their side effects.
+    #
+    # Moving everything anchored to target_origin earlier, as this did before,
+    # also moved the target relative to the text rows and relative to the audio
+    # conditions.  The audio history was exempted to avoid that, which displaced
+    # it by a frame - 41.7 ms at 24 fps - and pushed its last latent past
+    # target_origin.  Including it instead pushed the block below text_len,
+    # where the text rows live.
+    #
+    # Moving the block later has neither problem: every other relative distance
+    # is untouched by construction, and nothing lands below text_len.
+    delta = _RESERVE_DEFICIT * _FRAME_RESCALE * float(video_time_scale)
+    block_stop = text_len + carried * rows_per_frame
+    times[text_len:block_stop] += delta
 
     keyframe_frames = sum(_unpack_keyframe_anchor(entry)[1] for entry in anchors)
-    block_stop = text_len + carried * rows_per_frame
     keyframe_stop = text_len + keyframe_frames * rows_per_frame
-    times[block_stop:keyframe_stop] += delta        # "first" / "last" / "frame" keyframes
 
-    cursor = keyframe_stop
-    for entry in audio_condition_anchors:
-        anchor, length = entry if isinstance(entry, tuple) else (entry, 1)
-        stop = cursor + length * _AUDIO_CHANNELS
-        if anchor != "history":
-            times[cursor:stop] += delta
-        cursor = stop
-
-    target_start = (text_len + sequence.num_condition_video_rows
-                    + sequence.num_condition_audio_rows)
-    times[target_start:] += delta                   # target audio + target video
+    # Extended audio context.  The audio history is laid forward from
+    # float(text_len), so a longer block overruns target_origin, and pulling it
+    # backwards would land it on the text rows.  So everything else moves later
+    # by the same amount and the audio history keeps its start: the audio history
+    # then reaches `extra` latents further back than the video history, with
+    # every other relative distance preserved and nothing below text_len.
+    extra = int(STATE.audio_extra or 0)
+    if extra:
+        times[text_len:] += float(extra)
+        cursor = keyframe_stop
+        for entry in audio_condition_anchors:
+            anchor, length = entry if isinstance(entry, tuple) else (entry, 1)
+            stop = cursor + length * _AUDIO_CHANNELS
+            if anchor == "history":
+                times[cursor:stop] -= float(extra)
+            cursor = stop
     return sequence
 
 
@@ -1305,6 +1397,7 @@ def install():
                              for key, (owner, attribute) in available.items()})
     _log(f"installed v{VERSION} (enable={CONFIG.enable}, fix_coords={CONFIG.fix_coords}, "
          f"latents={CONFIG.latents or _DEFAULT_LATENTS}, audio={CONFIG.audio}, "
+         f"audio_context={CONFIG.audio_context or 'native'}, "
          f"colour={CONFIG.colour}, diagnose={CONFIG.diagnose}, "
          f"moment_match={CONFIG.moment_match})")
     return True

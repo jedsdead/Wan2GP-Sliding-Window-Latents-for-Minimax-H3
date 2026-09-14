@@ -4,7 +4,7 @@ A Wan2GP (WanGP) extension plugin that carries MiniMax H3 latents across
 sliding windows instead of re-encoding the previous window's decoded pixels,
 removing one VAE decode/encode round trip per window.
 
-Version 1.0.2 · MIT · built and verified against Wan2GP `362c346` (7 Sep 2026)
+Version 1.1 · MIT · built and verified against Wan2GP `362c346` (7 Sep 2026)
 
 Video and audio latent carry are on by default. Colour consistency is
 experimental and off by default. Do not run this alongside the Sliding Window
@@ -101,6 +101,7 @@ Environment variables, read once when the plugin loads.
 | `SWL_MATCH_TOL` | `0.03` | how closely the cached join frame must match the incoming history |
 | `SWL_ALIGN_SEARCH` | `1` | search the decoded tail for the join frame instead of testing one offset |
 | `SWL_AUDIO` | `1` | also carry audio latents |
+| `SWL_AUDIO_CONTEXT` | `0` | extra seconds of audio history; 0 keeps Wan2GP's 0.75s window |
 | `SWL_AUDIO_TOL` | `0.15` | how closely the cached audio envelope must match |
 | `SWL_DIAGNOSE` | `0` | also run the native encode and log how the two latent sets differ |
 | `SWL_COLOUR` | `0` | correct grade drift on the carried latents |
@@ -243,10 +244,9 @@ Same shape as the measurement needs, and each one discards rather than caps.
   against its own tail, and beyond the same threshold the correction is
   withheld.
 
-  Unlike a pixel correction there is no partial version available. The Sliding
-  Window Anchor plugin can find the cut and correct only up to it, leaving the
-  seam on the cut where nothing can be seen; here the unit being corrected is a
-  single block of tail latents, so it is valid for the tail or it is not.
+  Unlike a pixel correction there is no partial version available: the unit
+  being corrected is a single block of tail latents, so it is valid for the tail
+  or it is not.
 
   Comparing head against tail is sufficient rather than a full cut detector: a
   cut that does not change the grade needs no guarding, and one that does shows
@@ -333,6 +333,71 @@ decoder. `tests/test_colour_latents.py` proves the algebra is exact to 4e-16
 against that map; it does not and cannot prove the map matches the decoder.
 Measure with `tools/measure_joins.py` before trusting the gain axes.
 
+## Extended audio context
+
+Experimental, off by default (`SWL_AUDIO_CONTEXT`).
+
+Wan2GP sizes the audio condition from the video overlap:
+
+```python
+overlap_samples = round(continuation_count / fps * AUDIO_SAMPLE_RATE)
+```
+
+At overlap 18 and 24 fps that is 24000 samples - 0.75 seconds, 30 latents at
+the autoencoder's 800-sample hop. Generous for motion continuity, short for
+sound: less than a bar at most tempos, and shorter than many single spoken
+words.
+
+Setting `SWL_AUDIO_CONTEXT=2` carries 2 seconds of audio history instead. The
+video overlap is untouched. There is also an **Audio context** control in the
+panel, which persists to `state/settings.json` and takes precedence over the
+environment variable once used.
+
+The install line reports the setting, so it can be confirmed without guessing:
+
+```
+[sliding-window-latents] installed v... (enable=True, ..., audio=True,
+audio_context=2.0, ...)
+```
+
+`audio_context=native` there means the feature is off. Every window then says
+which path it took: the number of latents carried and how many were beyond the
+native window, or the reason none were added - the gate refusing, the cached
+tail being too short, or the request already being covered by the native
+window.
+
+### The layout problem it creates
+
+`_fill_audio_condition_positions` lays a history block *forward* from
+`float(text_len)`, so a longer block runs past `target_origin` into the target
+audio. Pulling it backwards instead would land it on the text rows, which
+occupy times 0..text_len-1.
+
+So everything else moves later by the same amount and the audio history keeps
+its start. The audio history then reaches further back than the video history,
+with every other relative distance preserved and nothing below `text_len`.
+`tests/test_audio_context.py` checks that geometry numerically.
+
+It is gated on the video carry having engaged and `fix_coords` being on, since
+that shift is where the compensation lives. Without both, the native audio
+window is used and the console says so.
+
+Confirmed working: at `SWL_AUDIO_CONTEXT=2` the console reports
+`carried 80 audio latents ... (2.00s context, 50 beyond the native window of
+30)`, and the carried-versus-encoded video statistics stay in their usual range,
+so extending the audio does not disturb the video path.
+
+Whether longer audio context actually *improves* the join is unmeasured. Render
+the same seed at 0 and at 2 and compare with
+`tools/measure_joins.py a.mp4 --baseline b.mp4 --window 242 --overlap 18`,
+reading the join HF step, join centroid step and chain HF slope. Try 1 as well:
+if it captures most of the benefit it is the better setting, at a fraction of
+the added rows.
+
+Cost, for scale — at 720p, 2s of audio context adds about 100 rows to the
+sequence, where raising `SWL_LATENTS` from 7 to 12 adds about 6,160. Audio
+context is cheap; video context is not.
+
 ## The coordinate correction
 
 This is the part that isn't a straight substitution, and it's the part most
@@ -362,11 +427,22 @@ n=7   layout  -22  -21  -17  -13   -9   -5   -4
               spacing identical, translation -1 frame (42 ms at 24fps)
 ```
 
-The fix moves everything anchored to `target_origin` **earlier** by that single
-frame and leaves the block untouched. The direction matters: a block's position
-is reported as `block_absolute - target_origin`, so raising `target_origin`
-widens the skew to two frames instead of closing it. `tests/test_layout_contract.py`
-pins this down and runs in a second without Wan2GP, torch or a GPU:
+The fix moves the **carried block one frame later** and leaves everything else
+alone.
+
+Up to 1.0.2 it did the opposite — moved everything anchored to `target_origin`
+one frame earlier, exempting the video history. The two are identical in
+relative terms, but moving the target also moved it relative to the text rows
+and relative to the audio conditions. The audio history was exempted from that
+to compensate, which displaced the audio by a frame — 41.7 ms at 24 fps — and
+pushed its last latent past `target_origin`. Including it instead pushed the
+block below `text_len`, where the text rows live. Moving the block has neither
+problem: every other distance is untouched by construction and nothing lands
+below `text_len`.
+
+`tests/test_layout_contract.py` pins the translation down and
+`tests/test_audio_context.py` the resulting geometry; both run in a second
+without Wan2GP, torch or a GPU:
 
 ```
 python tests/test_layout_contract.py
@@ -540,34 +616,10 @@ Row counts now come from packing's own `_frame_grid` rather than
 whenever `target_spatial_context` was set — a latent bug in the plain builder
 path too, not just Ref2VA.
 
-## Do not run this with Sliding Window Anchor
+## Sliding Window Anchor
 
-The Sliding Window Anchor plugin injects the previous window's final frame as a
-`"frame"` keyframe at `frame_index = history_count`, which `pipeline.py` turns
-into `frame_index = 0` - the same time coordinate as `target_origin`. Wan2GP
-already pins that frame there itself with a `"first"` anchor, and the carried
-history block reaches it too. Two or three condition blocks all asserting one
-instant makes the model hold on it, which is the frozen frame at the join.
-
-Changing the carried latent count does not avoid it. The final latent of a
-window always ends on that window's last frame, so the block reaches target
-frame 0 at every setting:
-
-```
-  n   frames   last latent covers   reaches frame 0
-  7       22               -3..+0              True
- 12       39               -3..+0              True
- 17       56               -3..+0              True
-```
-
-`n` changes how far back the block reaches, never where it ends.
-
-The anchor's frame injection has been redundant since Wan2GP added its own
-continuation pin (commit `5c8b4ac`, 8 August 2026, which introduced both
-`_add_video_history` and the `continuation[:, -1:]` pin together). Its colour
-matching is the part that is not redundant - but that is pixel-domain and
-cannot be combined with latent carry, which is why this plugin has its own
-latent-domain version.
+Use this plugin or the Sliding Window Anchor plugin, not both — running them
+together can add extra frames at the join.
 
 ## Compatibility
 

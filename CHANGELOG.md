@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.1
+- Fixed: the coordinate correction displaced the carried audio history by one
+  frame - 41.7 ms at 24 fps - and pushed its last latent past `target_origin`.
+  It moved everything anchored to `target_origin` earlier and exempted the audio
+  history, so the audio's relationship to the target changed even though the
+  carried audio tail ends at the join exactly where a native encode's does. The
+  correction now moves the carried video block one frame later instead, which is
+  identical in relative terms and leaves every other distance - audio, text,
+  keyframes - untouched.
+- Added `SWL_AUDIO_CONTEXT`, extra seconds of audio history beyond Wan2GP's
+  overlap-derived 0.75s window, with a matching panel control. Off by default.
+  Gated on the video carry and `fix_coords`, since the compensating layout shift
+  lives there.
+- The install line now reports `audio_context`, and every window logs which
+  carry path it took, so a setting that is not applying can be seen rather than
+  guessed at.
+- Added `tests/test_audio_context.py`, which checks the layout geometry
+  numerically at 0.5, 1, 2 and 4 seconds.
+
 ## 1.0.2
 - Fixed: the plugin stayed inert on every build. `_preflight` looked for
   `video_latent_frames` on `MiniMaxH3Pipeline`, but it is a module-level

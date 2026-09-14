@@ -31,11 +31,16 @@ block covers one frame more than the layout reserves for it, and the whole
 block is placed one pixel frame earlier than its content really sits.
 
 The correction must therefore move the block one frame LATER relative to
-target_origin. Since patches.py leaves the block alone and moves the rows
-anchored to target_origin instead, and a block's reported position is
-(block_absolute - target_origin), target_origin must move one frame
-EARLIER. The sign matters: applying it the other way triples nothing and
-doubles the error, taking a 1-frame skew to 2.
+target_origin, and patches.py does exactly that: it adds one frame to the
+carried block's own row times and leaves everything else alone.
+
+Moving the target one frame earlier instead would be identical in relative
+terms, and is what this did up to 1.0.2 - but it also moved the target
+relative to the text rows and relative to the audio conditions, which
+displaced the carried audio by a frame. See tests/test_audio_context.py.
+
+The sign matters either way: applying it backwards doubles the error,
+taking a 1-frame skew to 2.
 """
 
 import sys
@@ -83,9 +88,9 @@ def content_frames(n_latents, includes_join_frame):
     return (last - (covered - 1)) + offsets
 
 
-def corrected(n_latents, origin_shift_frames):
-    """Block position after moving target_origin by origin_shift_frames."""
-    return layout_frames(n_latents) - origin_shift_frames
+def corrected(n_latents, block_shift_frames):
+    """Block position after moving the block itself by block_shift_frames."""
+    return layout_frames(n_latents) + block_shift_frames
 
 
 # --- checks ---------------------------------------------------------------
@@ -127,14 +132,14 @@ for n in (5, 6, 8, 10):
     check(f"n={n:2d} is correctly rejected", n % 5 != 2)
 print()
 
-print("the correction: target_origin must move EARLIER by one frame")
+print("the correction: the carried block moves one frame LATER")
 for n in PHASE_ALIGNED:
     con = content_frames(n, includes_join_frame=True)
-    check(f"n={n:2d} shift of -1 frame resolves the skew",
-          np.allclose(corrected(n, -1), con))
-    check(f"n={n:2d} shift of +1 frame does NOT (this is the bug)",
-          not np.allclose(corrected(n, +1), con),
-          f"leaves {np.unique(corrected(n, +1) - con)} frame residual")
+    check(f"n={n:2d} moving the block +1 frame resolves the skew",
+          np.allclose(corrected(n, +1), con))
+    check(f"n={n:2d} moving it -1 frame does NOT (the sign matters)",
+          not np.allclose(corrected(n, -1), con),
+          f"leaves {np.unique(corrected(n, -1) - con)} frame residual")
 print()
 
 print("carried block reaches target frame 0, where the 'first' anchor also sits")
