@@ -31,7 +31,7 @@ NOTE = (
 
 # Anything the panel exposes.  Env vars still set the initial value; the saved
 # settings file wins over them once the panel has been used.
-TOGGLES = ("enable", "audio", "fix_coords", "moment_match", "diagnose",
+TOGGLES = ("enable", "video", "audio", "fix_coords", "moment_match", "diagnose",
            "colour")
 
 
@@ -66,6 +66,14 @@ class SlidingWindowLatentsPlugin(WAN2GPPlugin):
                 enable_cb = gr.Checkbox(
                     value=patches.CONFIG.enable,
                     label="Enable latent carry",
+                )
+                video_cb = gr.Checkbox(
+                    value=patches.CONFIG.video,
+                    label="Carry video latents",
+                    info="Off leaves Wan2GP's pixel re-encode in place and "
+                         "carries audio only. Audio substitution needs no "
+                         "coordinate correction, so this is the least invasive "
+                         "way to run the plugin.",
                 )
                 audio_cb = gr.Checkbox(
                     value=patches.CONFIG.audio,
@@ -151,14 +159,15 @@ class SlidingWindowLatentsPlugin(WAN2GPPlugin):
 
                 timer = gr.Timer(3)
 
-                controls = [enable_cb, audio_cb, audio_ctx_dd, latents_dd,
+                controls = [enable_cb, video_cb, audio_cb, audio_ctx_dd, latents_dd,
                             coords_cb, moment_cb, diagnose_cb,
                             colour_cb, colour_axes_cb, colour_match_dd,
                             colour_strength_sl]
 
-                def _apply(enable, audio, audio_context, carried, fix_coords, moment_match, diagnose,
-                           colour, colour_axes, colour_match, colour_strength):
+                def _apply(enable, video, audio, audio_context, carried, fix_coords, moment_match,
+                           diagnose, colour, colour_axes, colour_match, colour_strength):
                     patches.CONFIG.enable = bool(enable)
+                    patches.CONFIG.video = bool(video)
                     patches.CONFIG.audio = bool(audio)
                     patches.CONFIG.audio_context = float(audio_context)
                     patches.CONFIG.latents = int(carried)
@@ -204,6 +213,8 @@ class SlidingWindowLatentsPlugin(WAN2GPPlugin):
         if not patches.CONFIG.enable:
             return "Sliding Window Latents (off)"
         extras = []
+        if not patches.CONFIG.video:
+            extras.append("audio only" if patches.CONFIG.audio else "nothing carried")
         if not patches.CONFIG.fix_coords:
             extras.append("uncorrected coords")
         if patches.CONFIG.moment_match:
@@ -216,6 +227,7 @@ class SlidingWindowLatentsPlugin(WAN2GPPlugin):
         return (f"Windows carried: **{stats.get('engaged', 0)}** "
                 f"&nbsp;·&nbsp; re-encoded: **{stats.get('fell_back', 0)}** "
                 f"&nbsp;·&nbsp; audio carried: **{stats.get('audio_engaged', 0)}**  \n"
+                f"Video carry off for: **{stats.get('video_off', 0)}** window(s)  \n"
                 f"Colour corrected: **{stats.get('colour_applied', 0)}**  \n"
                 f"Last: {patches.STATE.last_message}")
 

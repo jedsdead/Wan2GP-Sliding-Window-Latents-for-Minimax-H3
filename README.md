@@ -97,6 +97,7 @@ Environment variables, read once when the plugin loads.
 | `SWL_FIX_COORDS` | `1` | apply the coordinate correction below |
 | `SWL_REQUIRE_WINDOW_NO` | `1` | refuse to carry when the caller does not report `window_no` |
 | `SWL_LATENTS` | `0` | carried latent count; `0` uses 7. Must be ≡ 2 (mod 5): 7, 12, 17… |
+| `SWL_VIDEO` | `1` | carry video latents. `0` with `SWL_AUDIO=1` gives audio-only carry |
 | `SWL_VERBOSE` | `1` | log every engage and every fall back |
 | `SWL_MATCH_TOL` | `0.03` | how closely the cached join frame must match the incoming history |
 | `SWL_ALIGN_SEARCH` | `1` | search the decoded tail for the join frame instead of testing one offset |
@@ -565,6 +566,8 @@ All of these fall back to stock re-encoding and say so:
   (`discard_last_frames`, `automatic_trim_last_frames`) between capture and use.
 - **Slice off phase** — `SWL_LATENTS` not ≡ 2 (mod 5), or a previous window too
   short to give a phase-aligned slice.
+- **A trimmed window** — an end image pinned short of the window's last
+  generated frame. See *End images* below.
 
 ## A/B protocol
 
@@ -615,6 +618,111 @@ Row counts now come from packing's own `_frame_grid` rather than
 `(latent_height // patch_h) * (latent_width // patch_w)`, which was wrong
 whenever `target_spatial_context` was set — a latent bug in the plain builder
 path too, not just Ref2VA.
+
+## End images
+
+Wan2GP sets `image_end_frame_position` for H3, so an end image arrives as a
+`"frame"` keyframe anchor rather than a `"last"` one (`pipeline.py:801`). Its
+time is `target_origin + frame_index * _FRAME_RESCALE` (`packing.py:185`) — a
+position relative to `target_origin`, exactly like the target video's own grid.
+
+That makes an end image structurally independent of the carry:
+
+- `_add_video_history` appends first (`pipeline.py:793`), so the history anchor
+  is still `keyframe_anchors[0]` however many image conditions follow it, and
+  the check in `_apply_origin_shift` holds.
+- The correction moves rows `[text_len, text_len + carried * rows_per_frame)`
+  only. Every image condition sits after that span and is untouched.
+- The end frame is anchored to `target_origin`; the carried block is moved
+  *relative to* `target_origin`. The two never interact.
+- `keyframe_stop`, which the extended-audio shift uses to find the audio
+  condition rows, sums **all** anchors — the same sum `build_packed_sequence`
+  uses for `condition_audio_start` — so the extra image conditions are already
+  accounted for.
+
+So an end image needs no special handling, and the plugin does not refuse on
+seeing one. **This applies to `image_end` only.** Frames placed through
+`frames_to_inject` are a different mechanism with a different failure — see
+*Conditions on the join frame*.
+
+### But a trimmed window does
+
+`wgp.py:7724` sets
+
+```
+image_end_frame_position = current_video_length - tail_trim_frames - 1
+```
+
+where `tail_trim_frames` is `discard_last_frames + automatic_trim_last_frames`.
+A window with a tail trim **generates more frames than it emits**, so its cached
+latents end past the end of the video the next window hands back as
+continuation. The carried block would then be placed as though its last latent
+were the join, and the overrun gets rendered a second time.
+
+`_check_alignment` would normally catch this as a negative skew. But a window
+pinned to an end image tends to settle onto a held composition, and on a flat
+tail the search abstains by design and leaves the decision to `SWL_MATCH_TOL` —
+which a static shot passes. So the trim is refused up front instead, in
+`_plan_window`, where it is a number rather than an inference from pixels:
+
+```
+this window will not be cached: end image is pinned 4 frame(s) before the last
+generated frame, so the emitted window is trimmed and its cached tail would
+overrun it
+```
+
+The refusal marks *that* window uncacheable. It does not stop the window from
+carrying from its own predecessor, which is unaffected.
+
+Note this is the only place a tail trim is visible from inside `generate()` —
+`discard_last_frames` is not among its arguments. Without an end image the
+alignment search remains the only defence against a trim.
+
+The position is classified rather than subtracted blindly. It is an ordinary
+pipeline argument and a plugin can set it to anything; an end image resolving to
+target frame 0 is a condition on the join, not a 105-frame trim, and is reported
+as such.
+
+## Conditions on the join frame
+
+Target frame 0 is the join. Wan2GP pins it with a `"first"` anchor
+(`pipeline.py:794`) and, once corrected, the carried block's last latent reaches
+it too — two blocks describing one instant from two directions, which reinforce.
+A third makes the model hold on it, and the join gains a frame that does not
+move.
+
+The injection loop at `pipeline.py:802` subtracts `history_count` from every
+position it is handed and keeps what lands inside the target, so **a raw
+position of exactly `history_count` resolves to frame 0**.
+
+**Sliding Window Anchor** does that deliberately, every window. Its
+`_history_count` returns `min(prefix, input_video.shape[1]) - 1` — 17 at overlap
+18 — and `_inject` appends exactly that as the raw index. 17 − 17 = 0.
+
+**Wan2GP's own `L` injection does not**, despite the symmetry suggesting it
+might. On FL2VA and Ref2VA `extract_guide_from_window_start` is `False` (it is
+set only on the Viggle variant, `h3handler.py:401`), so the per-window slice is
+`frames_to_inject[guide_start_frame : guide_end_frame]` and a frame's relative
+position resolves to `abs_pos - window_start_frame`. With
+`window_start_frame = guide_start_frame - reuse_frames`, the smallest relative
+position reachable is `reuse_frames` = 18, so the smallest `frame_index` is
+`18 - 17` = **1**.
+
+The frame is out of range regardless: `cur_end_pos` tracks a window's last
+*emitted* frame, so window N's `L` frame sits at `guide_start_{N+1} - 1`, one
+index below where window N+1's slice starts. It is not handed forward. Inside
+its own window it lands on `target_frames - 1`, the same slot an untrimmed end
+image occupies, and is safe for the same reason.
+
+So latents carry normally alongside `L` frames. The guard is keyed to the
+collision rather than to a plugin name because that is the cheap and durable way
+to express it, not because a second case is known to reach it.
+
+This is a narrower rule than "do not run the two plugins together", which
+remains the advice — Anchor's frame injection has been redundant since Wan2GP
+commit `5c8b4ac` anyway, and its colour matching is pixel-domain and
+incompatible with carrying. What the guard adds is that the join no longer
+breaks silently when both are on.
 
 ## Sliding Window Anchor
 

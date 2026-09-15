@@ -88,6 +88,9 @@ changes behaviour live and anything saved from it wins over the environment.
                             not report window_no                   (default 1)
   SWL_LATENTS       int    carried latent count; 0 uses 7.  Must
                             be 2 (mod 5): 7, 12, 17...             (default 0)
+  SWL_VIDEO         1/0    carry video latents.  Set 0 with
+                            SWL_AUDIO=1 for audio-only carry,
+                            which needs no coordinate work at all  (default 1)
   SWL_AUDIO         1/0    also carry audio latents               (default 1)
   SWL_VERBOSE       1/0    log every engage / fall back           (default 1)
   SWL_MATCH_TOL     float  join-frame fingerprint tolerance       (default 0.03)
@@ -133,6 +136,7 @@ _COLOUR_SPAN = 5                    # frames measured each side of a join
 _COLOUR_POOL = 64                   # measurement is pooled to this width
 _COLOUR_CONTINUATION_SPAN = 48      # a continuation can measure more; see README
 _COLOUR_CHUNK = 4_000_000           # values per pixel-correction chunk
+_VIDEO_OFF = "video carry is switched off (audio-only)"
 _MAX_CACHED_LATENTS = 17            # floor for the cached tail; covers n = 7, 12 and 17.
                                     # _cache_depth() raises this to match a larger
                                     # SWL_LATENTS so the cap can never silently
@@ -157,6 +161,13 @@ class _Config:
             self.match_tolerance = float(os.environ.get("SWL_MATCH_TOL", "0.03"))
         except ValueError:
             self.match_tolerance = 0.03
+        # The two carries are independent.  Video substitution happens in
+        # _add_video_history and needs the coordinate correction; audio
+        # substitution happens in _encode_audio and needs none, because
+        # _fill_audio_condition_positions lays audio out on a uniform integer
+        # axis.  So SWL_VIDEO=0 with SWL_AUDIO=1 is a real mode, not a
+        # degenerate one - it is the plugin's least invasive configuration.
+        self.video = _flag("SWL_VIDEO", "1")
         self.audio = _flag("SWL_AUDIO", "1")
         self.diagnose = _flag("SWL_DIAGNOSE", "0")
         self.moment_match = _flag("SWL_MOMENT_MATCH", "0")
@@ -322,7 +333,7 @@ class _State:
         self.colour_seeded = False       # reference came from a continuation
         self.last_message = "idle"
         self.stats = {"engaged": 0, "fell_back": 0, "audio_engaged": 0,
-                      "colour_applied": 0}
+                      "colour_applied": 0, "video_off": 0}
 
     def invalidate(self, reason):
         if self.latents is not None:
@@ -346,7 +357,7 @@ class _State:
 
 STATE = _State()
 
-VERSION = "1.1"
+VERSION = "1.2"
 
 _PACKING = None                     # packing module, resolved by _preflight()
 
@@ -771,6 +782,14 @@ def _audio_extension(native_latents, cached_latents):
     """
     if CONFIG.audio_context <= 0:
         return 0
+    if not CONFIG.video:
+        # Worth naming: in audio-only mode there is no carried video block, so
+        # _apply_origin_shift never runs and the compensating shift has nowhere
+        # to live.  Without this the generic message below sends people looking
+        # at fix_coords, which is not what is holding it.
+        _log("extended audio context needs the video carry, which is off "
+             "(SWL_VIDEO=0); using the native audio window")
+        return 0
     if STATE.active_latents is None or not CONFIG.fix_coords:
         _log("extended audio context needs the video carry and fix_coords; "
              "using the native audio window for this window")
@@ -829,6 +848,108 @@ def _continues_cached_window(source_window_no):
     return True, None
 
 
+def _end_image_problem(values, history_count, aligned):
+    """Whether this window's end image says something the plugin cannot cache.
+
+    Wan2GP puts an end image on the window's last *emitted* frame:
+    `image_end_frame_position = current_video_length - tail_trim_frames - 1`
+    (wgp.py:7724), passed through to the pipeline, which subtracts
+    history_count and conditions that target frame (pipeline.py:801).  So under
+    wgp's own formula the distance from the end image to the last target frame
+    is the tail trim - and a trimmed window generates more frames than it
+    emits, which means its cached tail ends past the video the next window
+    hands back as continuation.  The carried block would then be placed as
+    though its last latent were the join, and the overrun is rendered twice.
+
+    `_check_alignment` would normally catch that as a negative skew, but a
+    window pinned to an end image tends to settle onto a held composition, and
+    on a flat tail the search abstains by design and leaves the decision to
+    SWL_MATCH_TOL - which a static shot passes.  Hence a guard here, where the
+    position is a number rather than an inference from pixels.
+
+    Classified rather than subtracted blindly.  The position is an ordinary
+    pipeline argument and a plugin can set it to anything; Sliding Window
+    Anchor's own notes contemplate an end image landing on the *opening* frame.
+    Reading that as a trim would produce a large, confident and wrong number.
+    """
+    if values.get("image_end") is None:
+        return None
+    raw = values.get("image_end_frame_position")
+    if raw is None:
+        # pipeline.py:799 puts it on aligned_target_frames - 1 with a "last"
+        # anchor.  That is the window's real last frame, so there is no trim
+        # to infer and nothing to refuse.
+        return None
+    try:
+        index = int(raw) - int(history_count)
+    except (TypeError, ValueError):
+        return "image_end_frame_position is not a whole number"
+
+    if index < 0:
+        # pipeline.py:801 does not bounds-check this the way the injection loop
+        # at 804 does, so the condition would land below target_origin, inside
+        # the span the history block occupies.  Not a layout this plugin models.
+        return (f"end image resolves to target frame {index}, below the target; "
+                f"the pipeline does not bounds-check that position and the "
+                f"resulting layout is not one this plugin models")
+    if 0 < index < aligned - 1:
+        return (f"end image sits at target frame {index} of {aligned - 1}; under "
+                f"wgp.py's own formula that is a {aligned - 1 - index}-frame tail "
+                f"trim, so the window emits fewer frames than it generates and "
+                f"the cached tail would overrun the emitted video")
+    # index == 0 is a condition on the join frame, not a trim.  That is a carry
+    # problem, not a caching one, and _frame_zero_collision reports it.
+    return None
+
+
+def _frame_zero_collision(values, history_count):
+    """Image conditions the pipeline will place on target frame 0, if any.
+
+    Target frame 0 is the join.  Wan2GP already pins it with a "first" anchor
+    (`_add_image_condition(continuation[:, -1:], 0, ...)`, pipeline.py:794) and
+    the corrected carried block's last latent also reaches it - two blocks
+    describing one instant from two directions, which reinforce.  A third makes
+    the model hold on it, and the join gains a frame that does not move.
+
+    The injection loop at pipeline.py:802 subtracts history_count from every
+    position it is given and keeps what lands inside the target, so a position
+    of exactly history_count resolves to frame 0.  That is not a corner case:
+    it is where the Sliding Window Anchor plugin deliberately puts its anchor,
+    and Wan2GP's own `L` injection places a frame at the end of a window, which
+    is handed to the *next* window at that same relative position.
+
+    So this is keyed to the collision rather than to a plugin name.  Whatever
+    put a condition on frame 0, the carried block is the assertion to drop -
+    leaving the native pin and the injected frame, which is what the injecting
+    feature expects to be working against.  Returns a reason, or None.
+    """
+    culprits = []
+    images = list(values.get("frames_to_inject") or ())
+    positions = list(values.get("frames_relative_positions_list") or ())
+    for image, position in zip(images, positions):
+        if image is None:                    # an unfilled slot, not a frame
+            continue
+        try:
+            if int(position) - int(history_count) == 0:
+                culprits.append("an injected frame")
+        except (TypeError, ValueError):
+            continue
+
+    if values.get("image_end") is not None:
+        try:
+            if int(values.get("image_end_frame_position")) - int(history_count) == 0:
+                culprits.append("an end image")
+        except (TypeError, ValueError):
+            pass
+
+    if not culprits:
+        return None
+    what = " and ".join(sorted(set(culprits)))
+    return (f"{what} is conditioned on target frame 0, where Wan2GP already pins "
+            f"the join frame and the carried block would also reach; carrying "
+            f"would make a third block assert that instant")
+
+
 def _plan_window(pipeline, args, kwargs):
     """Mirror the few lines of generate() that decide the target frame count.
 
@@ -848,7 +969,10 @@ def _plan_window(pipeline, args, kwargs):
     window_no = _window_number(values)
 
     def refuse(reason):
-        return {"usable": False, "window_no": window_no, "reason": reason}
+        # An unusable window can still carry from its predecessor: "usable"
+        # describes what this window hands forward, not what it may receive.
+        return {"usable": False, "window_no": window_no, "reason": reason,
+                "carry_blocked": None}
 
     if args:
         return refuse("generate() called positionally, cannot read arguments")
@@ -881,8 +1005,16 @@ def _plan_window(pipeline, args, kwargs):
         # cached latent no longer ends on the join frame.
         return refuse(f"target {target_frames} != aligned {aligned}")
 
+    end_problem = _end_image_problem(values, history_count, aligned)
+    if end_problem:
+        return refuse(end_problem)
+
     return {"usable": True,
             "window_no": window_no,
+            # Conditions the pipeline will place on target frame 0.  Blocks the
+            # carry rather than the cache: it is this window's conditioning that
+            # is crowded, and its own output is a perfectly good window to cache.
+            "carry_blocked": _frame_zero_collision(values, history_count),
             # generate() only encodes continuation audio when it has both
             # continuation frames and a waveform (pipeline._waveform returns None
             # for a missing input_waveform).  Without both, the first
@@ -930,6 +1062,14 @@ def _take_cached(history_video):
     """Return latents to use as the history block, or None to fall back."""
     if not CONFIG.enable:
         return None, "disabled"
+    if not CONFIG.video:
+        return None, _VIDEO_OFF
+
+    blocked = (STATE.plan or {}).get("carry_blocked")
+    if blocked:
+        # About this window's conditioning, not about the cache, so it is read
+        # from the current plan rather than from the cached window's.
+        return None, blocked
 
     with STATE.lock:
         latents = STATE.latents
@@ -1014,8 +1154,15 @@ def _patched_add_video_history(self, video, visual_latents, keyframes):
             _log(f"colour: could not read the continuation reference: {error!r}")
     latents, reason = _take_cached(video)
     if latents is None:
-        STATE.stats["fell_back"] += 1
-        _log(f"re-encoding history ({reason})")
+        if reason is _VIDEO_OFF:
+            # Asked for, not failed.  Kept out of the fall-back tally so that
+            # counter keeps meaning "wanted to carry and could not", which is
+            # what the panel readout and the A/B protocol both read it as.
+            STATE.stats["video_off"] += 1
+            _log("re-encoding history (audio-only carry selected)")
+        else:
+            STATE.stats["fell_back"] += 1
+            _log(f"re-encoding history ({reason})")
         result = _ORIGINALS["add_video_history"](self, video, visual_latents, keyframes)
         if result is not None and not STATE.history_returns_value:
             STATE.history_returns_value = True
@@ -1396,6 +1543,7 @@ def install():
     _ORIGINAL_OWNERS.update({key: (owner, attribute)
                              for key, (owner, attribute) in available.items()})
     _log(f"installed v{VERSION} (enable={CONFIG.enable}, fix_coords={CONFIG.fix_coords}, "
+         f"video={CONFIG.video}, "
          f"latents={CONFIG.latents or _DEFAULT_LATENTS}, audio={CONFIG.audio}, "
          f"audio_context={CONFIG.audio_context or 'native'}, "
          f"colour={CONFIG.colour}, diagnose={CONFIG.diagnose}, "

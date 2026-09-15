@@ -1,5 +1,53 @@
 # Changelog
 
+## 1.2
+- Added `SWL_VIDEO`, with a matching panel control. `SWL_VIDEO=0` with
+  `SWL_AUDIO=1` carries audio only, leaving Wan2GP's pixel re-encode in place
+  for the video history. The two carries were always independent - video
+  substitution happens in `_add_video_history`, audio in `_encode_audio` - but
+  there was no way to ask for one without the other. Audio-only needs no
+  coordinate correction at all, since audio conditions are laid on a uniform
+  integer axis, so it is the plugin's least invasive configuration.
+  `SWL_AUDIO_CONTEXT` is unavailable in this mode and says so: the compensating
+  layout shift lives in the video carry.
+- A deliberate audio-only run no longer counts as a fall back, so that counter
+  keeps meaning "wanted to carry and could not".
+- Added a guard for trimmed windows. `wgp.py` sets
+  `image_end_frame_position = current_video_length - tail_trim_frames - 1`, so
+  an end image pinned short of the last generated frame reveals a tail trim -
+  the one place a trim is visible from inside `generate()`. Such a window
+  generates more frames than it emits, so its cached tail would end past the
+  video the next window hands back. `_check_alignment` would usually catch that
+  as a negative skew, but a window pinned to an end image tends to settle onto a
+  held composition, and on a flat tail the search abstains by design and leaves
+  the decision to the tolerance, which a static shot passes.
+- Added a guard for anything conditioned on target frame 0. Wan2GP pins the join
+  there with a `"first"` anchor and the corrected carried block reaches it too;
+  a third block asserting that instant makes the model hold on it and the join
+  gains a frame that does not move. `pipeline.py:802` subtracts `history_count`
+  from every injected position, so a raw position of exactly `history_count`
+  lands on frame 0 - which is where Sliding Window Anchor puts its anchor
+  (`_history_count` returns 17 at overlap 18 and `_inject` appends it raw). It
+  blocks the carry for that window, not the cache: the window's own output is
+  still sound. Keyed to the collision rather than to a plugin name.
+- Wan2GP's own `L` frame injection does **not** reach frame 0 and needs no
+  guard. On FL2VA and Ref2VA `extract_guide_from_window_start` is False, so a
+  frame's relative position resolves to `abs_pos - window_start_frame` and the
+  smallest value reachable is `reuse_frames`, giving a minimum `frame_index` of
+  1. An `L` frame also sits one index below the next window's slice, so it is
+  not handed forward at all. Latents carry normally alongside `L` frames;
+  `tests/test_carry_modes.py` pins the arithmetic.
+- The end-image position is now classified rather than subtracted blindly. A
+  plugin can set `image_end_frame_position` to anything, and reading a position
+  on the opening frame as a tail trim would have produced a large, confident and
+  wrong number.
+- An end image that is *not* short of the last frame changes nothing and is not
+  refused: it arrives as a `"frame"` anchor positioned relative to
+  `target_origin`, while the correction moves the carried block relative to the
+  same origin, so the two cannot interact. Documented under *End images*.
+- Added `tests/test_carry_modes.py`, which loads `patches.py` against stubbed
+  Wan2GP modules and exercises both paths.
+
 ## 1.1
 - Fixed: the coordinate correction displaced the carried audio history by one
   frame - 41.7 ms at 24 fps - and pushed its last latent past `target_origin`.
