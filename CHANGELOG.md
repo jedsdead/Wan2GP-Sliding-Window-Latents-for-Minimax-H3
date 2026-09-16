@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.2
+## 1.2.1
 - Added `SWL_VIDEO`, with a matching panel control. `SWL_VIDEO=0` with
   `SWL_AUDIO=1` carries audio only, leaving Wan2GP's pixel re-encode in place
   for the video history. The two carries were always independent - video

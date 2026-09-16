@@ -357,7 +357,7 @@ class _State:
 
 STATE = _State()
 
-VERSION = "1.2"
+VERSION = "1.2.1"
 
 _PACKING = None                     # packing module, resolved by _preflight()
 
