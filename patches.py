@@ -357,7 +357,7 @@ class _State:
 
 STATE = _State()
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 
 _PACKING = None                     # packing module, resolved by _preflight()
 
@@ -764,6 +764,27 @@ def _audio_latent_fps():
         return _AUDIO_LATENT_FPS_FALLBACK
 
 
+def _reference_rows_locatable():
+    """Whether the packed-sequence type reports the row totals we need.
+
+    Checked at the type rather than at an instance, because _audio_extension has
+    to decide before any sequence exists.
+    """
+    global _REF_ROWS_LOCATABLE
+    if _REF_ROWS_LOCATABLE is None:
+        try:
+            fields = set(getattr(_PACKING.MiniMaxH3PackedSequence,
+                                 "__dataclass_fields__", {}) or {})
+            _REF_ROWS_LOCATABLE = {"num_condition_video_rows",
+                                   "num_condition_audio_rows"} <= fields
+        except Exception:
+            _REF_ROWS_LOCATABLE = False
+    return _REF_ROWS_LOCATABLE
+
+
+_REF_ROWS_LOCATABLE = None
+
+
 def _audio_extension(native_latents, cached_latents, pipeline=None):
     """How many audio latents to carry beyond what the native encode produced.
 
@@ -782,7 +803,7 @@ def _audio_extension(native_latents, cached_latents, pipeline=None):
     """
     if CONFIG.audio_context <= 0:
         return 0
-    if getattr(pipeline, "reference_mode", False):
+    if getattr(pipeline, "reference_mode", False) and not _reference_rows_locatable():
         # Ref2VA.  build_ref2va_packed_sequence lays the reference tokens on the
         # time axis *below* the history, advancing a cursor from float(text_len)
         # to time_cursor (packing.py:236-263), and only then places the history
@@ -791,19 +812,13 @@ def _audio_extension(native_latents, cached_latents, pipeline=None):
         #
         # The block translation is unaffected by that: both derive from the same
         # cursor, so the discrepancy it corrects is invariant to where the cursor
-        # ended up.  The extension is not.  It works by moving everything except
-        # the audio history later by `extra`, which opens a gap of `extra` below
-        # the history for the longer audio tail to occupy.  On FL2VA that gap is
-        # vacant.  On Ref2VA the reference tokens were sitting there and move up
-        # by `extra` along with everything else, so they land exactly on top of
-        # the tail the gap was opened for.
-        #
-        # Fixing that means holding the reference rows still while the rest
-        # moves, which is a layout change this plugin has no way to validate
-        # yet.  Until then, Ref2VA gets the native audio window.
-        _log("extended audio context is not applied on Ref2VA: the reference "
-             "tokens occupy the time the longer tail would need; using the "
-             "native audio window")
+        # ended up.  The extension is not - it has to hold the reference rows
+        # still while everything else moves, which means finding their span.  If
+        # the builder does not report the row totals that span is derived from,
+        # there is nothing safe to do but decline.
+        _log("extended audio context is not applied on Ref2VA: this build does "
+             "not report the condition row counts needed to locate the "
+             "reference tokens; using the native audio window")
         return 0
     if not CONFIG.video:
         # Worth naming: in audio-only mode there is no carried video block, so
@@ -1303,16 +1318,43 @@ def _rows_per_frame(latent_height, latent_width, patch_size, target_spatial_cont
     return int(grid.shape[0])
 
 
+def _reference_row_stop(sequence, text_len, reference_start):
+    """Row after the last Ref2VA reference row.
+
+    The references occupy one contiguous span between the keyframe audio rows
+    and the target audio rows (packing.py:233-265 walk a single cursor from
+    reference_start), so the two condition-row totals the builder reports are
+    enough to find its end: keyframe rows + reference rows is exactly
+    num_condition_video_rows + num_condition_audio_rows.
+
+    Returns reference_start when there are no references, and None when the
+    totals cannot be read - the caller must not guess.
+    """
+    try:
+        condition_rows = (int(sequence.num_condition_video_rows)
+                          + int(sequence.num_condition_audio_rows))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    stop = text_len + condition_rows
+    return stop if stop >= reference_start else None
+
+
 def _apply_origin_shift(sequence, text_len, keyframe_anchors, audio_condition_anchors,
                         rows_per_frame, video_time_scale):
-    """Move everything anchored to target_origin up by one pixel frame.
+    """Correct the carried block's placement, and make room for a longer audio tail.
+
+    Two independent adjustments, both applied by moving rows rather than by
+    moving target_origin (see the comments on each).
 
     Shared by both sequence builders.  The row layout is
     [text][condition video][condition audio][target audio][target video] in each;
-    Ref2VA additionally packs its reference rows inside the two condition spans.
-    Those references are positioned from time_cursor, below target_origin, so
-    they are left alone - as is the carried history block itself, whose internal
-    spacing is already correct because the slice is phase-aligned.
+    Ref2VA additionally packs its reference rows inside the two condition spans,
+    contiguously, between the keyframe audio rows and the target audio rows.
+    Those references are positioned from a cursor that runs below target_origin,
+    and both adjustments leave them where they are - the block translation
+    because it touches only the carried block's own rows, the audio extension
+    because it skips their span explicitly.  The carried block's internal
+    spacing is already correct, because the slice is phase-aligned.
     """
     _unpack_keyframe_anchor = _PACKING._unpack_keyframe_anchor
 
@@ -1359,7 +1401,33 @@ def _apply_origin_shift(sequence, text_len, keyframe_anchors, audio_condition_an
     # every other relative distance preserved and nothing below text_len.
     extra = int(STATE.audio_extra or 0)
     if extra:
-        times[text_len:] += float(extra)
+        # "Everything else" excludes the Ref2VA reference rows.  They sit below
+        # the history in time, so moving them later by `extra` would march them
+        # straight into the gap that is being opened for the audio tail - the
+        # references end where the audio history starts, so the last `extra` of
+        # their span would land exactly on the first `extra` of the tail.
+        # Holding them still puts the gap between the references and the video
+        # history, which is the same arrangement FL2VA gets between the text
+        # rows and the video history.
+        keyframe_audio_rows = sum(
+            (entry[1] if isinstance(entry, tuple) else 1) * _AUDIO_CHANNELS
+            for entry in audio_condition_anchors)
+        reference_start = keyframe_stop + keyframe_audio_rows
+        reference_stop = _reference_row_stop(sequence, text_len, reference_start)
+
+        if reference_stop is None:
+            # Should be unreachable: _audio_extension refuses reference mode
+            # when the row counts cannot be read.
+            _log("ERROR: cannot locate the reference rows; extended audio "
+                 "context may collide with them. Set SWL_AUDIO_CONTEXT=0 "
+                 "and please report this.")
+            times[text_len:] += float(extra)
+        elif reference_stop > reference_start:
+            times[text_len:reference_start] += float(extra)
+            times[reference_stop:] += float(extra)
+        else:
+            times[text_len:] += float(extra)
+
         cursor = keyframe_stop
         for entry in audio_condition_anchors:
             anchor, length = entry if isinstance(entry, tuple) else (entry, 1)
@@ -1401,14 +1469,6 @@ def _patched_build_ref2va_packed_sequence(text_token_tags, references, num_laten
 
     if STATE.active_latents is None or not CONFIG.fix_coords:
         return sequence
-    if references and STATE.audio_extra:
-        # Unreachable if the Ref2VA gate in _audio_extension did its job.  Said
-        # out loud rather than trusted, because the failure is silent: the extra
-        # audio latents would be given times the reference tokens also hold.
-        _log(f"ERROR: {len(list(references))} reference(s) present with "
-             f"{STATE.audio_extra} extra audio latents carried; the extended "
-             f"audio tail and the references now share time coordinates. "
-             f"Set SWL_AUDIO_CONTEXT=0 and please report this.")
     return _apply_origin_shift(
         sequence, int(text_token_tags.shape[0]), keyframe_anchors, audio_condition_anchors,
         _rows_per_frame(latent_height, latent_width, patch_size, target_spatial_context),

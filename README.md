@@ -745,23 +745,36 @@ Row arithmetic holds too. In the Ref2VA layout the keyframe rows start at
 `keyframe_audio_start`, *before* the reference rows, which is exactly where
 `_apply_origin_shift` looks for them.
 
-### One exception: `SWL_AUDIO_CONTEXT` is off on Ref2VA
+### `SWL_AUDIO_CONTEXT` on Ref2VA
 
 Extended audio context works by moving everything except the audio history later
 by `extra`, opening a gap of `extra` below the history for the longer tail. On
-FL2VA that gap is vacant. On Ref2VA the reference tokens were sitting there and
-move up by `extra` with everything else, landing on top of the tail the gap was
-opened for.
+FL2VA that gap is vacant. On Ref2VA the reference tokens sit in it, so moving
+them with everything else marches them straight back into it — the references
+end exactly where the audio history starts, so the last `extra` of their span
+lands on the first `extra` of the tail.
 
-So `SWL_AUDIO_CONTEXT` is refused in reference mode, with a log line saying so.
-Everything else — the video carry, the audio carry, the coordinate correction,
-colour consistency — is unchanged. This is not specific to RefMods: it applies
-to native Ref2VA reference images too. RefMods only make it certain to come up.
+The reference rows are held still instead. They form one contiguous span between
+the keyframe audio rows and the target audio rows, since `packing.py:233-265`
+walks a single cursor across them, and its end is
+`text_len + num_condition_video_rows + num_condition_audio_rows`. Holding it
+puts the gap between the references and the video history, which is the same
+arrangement FL2VA has between the text rows and the video history.
 
-Fixing it properly means holding the reference rows still while the rest moves.
-That is a tractable change and the row ranges are available in the builder, but
-it is new layout work and `SWL_AUDIO_CONTEXT` has no hardware validation yet, so
-it is left gated.
+The block translation is not affected either way: `history_time` and
+`target_origin` both derive from the reference cursor, so the distance the
+correction closes is invariant to it.
+
+`tests/test_ref2va_audio_context.py` models the builder's time axis and checks
+occupancy directly, across reference loads from none to eleven and extensions
+from 1 to 96 latents. It asserts that the naive version *does* collide, so a
+regression cannot pass it silently.
+
+If a build does not report the two condition-row counts, the span cannot be
+located and the extension declines with a log line rather than guessing.
+
+**Still unvalidated on hardware**, like the rest of `SWL_AUDIO_CONTEXT`. The
+geometry is checked arithmetically and the setting is off by default.
 
 ### Two things to know
 

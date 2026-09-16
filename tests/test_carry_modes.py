@@ -363,9 +363,23 @@ patches.STATE.active_latents = object()
 
 check("FL2VA still extends",
       patches._audio_extension(30, 192, FakePipeline(False)) > 0)
-check("Ref2VA does not extend",
+# Forced, because the stubbed packing module has no MiniMaxH3PackedSequence for
+# _reference_rows_locatable to inspect - and it declining on a stub is itself
+# the correct answer, checked two assertions below.
+patches._REF_ROWS_LOCATABLE = True
+check("Ref2VA extends when the reference rows can be located",
+      patches._audio_extension(30, 192, FakePipeline(True)) > 0,
+      "_apply_origin_shift holds that span still; see "
+      "tests/test_ref2va_audio_context.py")
+
+# The capability check is what decides, not the mode.
+patches._REF_ROWS_LOCATABLE = False
+check("Ref2VA declines when the builder does not report the row counts",
       patches._audio_extension(30, 192, FakePipeline(True)) == 0,
-      "reference tokens hold the time the longer tail would need")
+      "nothing safe to do without the reference span")
+check("FL2VA is unaffected by that, since it has no reference rows",
+      patches._audio_extension(30, 192, FakePipeline(False)) > 0)
+patches._REF_ROWS_LOCATABLE = None
 check("a pipeline that does not report the mode is treated as FL2VA",
       patches._audio_extension(30, 192, None) > 0,
       "reference_mode is absent on FL2VA, so the default must not refuse")

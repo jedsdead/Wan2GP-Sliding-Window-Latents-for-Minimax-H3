@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.2.2
+- `SWL_AUDIO_CONTEXT` now works on Ref2VA. 1.2.1 refused it there because the
+  extension moved the reference tokens later along with everything else, walking
+  them back into the gap it had just opened for the longer audio tail. The
+  reference rows are held still instead: they are one contiguous span between
+  the keyframe audio rows and the target audio rows, ending at
+  `text_len + num_condition_video_rows + num_condition_audio_rows`. That puts
+  the gap between the references and the video history, matching what FL2VA has
+  between the text rows and the video history.
+- The extension still declines, with a log line, on a build that does not report
+  those two row counts, since the span cannot be located without them.
+- Added `tests/test_ref2va_audio_context.py`, which models the builder's time
+  axis and checks occupancy across reference loads from none to eleven and
+  extensions from 1 to 96 latents. It asserts the naive version collides, so the
+  regression cannot pass silently.
+- Corrected `_apply_origin_shift`'s docstring, which claimed the references were
+  left alone — true of the block translation, not of the extension, which was
+  the bug.
+
 ## 1.2.1
 - Added `SWL_VIDEO`, with a matching panel control. `SWL_VIDEO=0` with
   `SWL_AUDIO=1` carries audio only, leaving Wan2GP's pixel re-encode in place
