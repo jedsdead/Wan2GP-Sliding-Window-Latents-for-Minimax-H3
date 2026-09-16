@@ -738,7 +738,7 @@ def _patched_encode_audio(self, waveform):
              f"{tuple(native.shape)})")
         return native
 
-    extra = _audio_extension(wanted, cached.shape[-1])
+    extra = _audio_extension(wanted, cached.shape[-1], self)
     STATE.audio_extra = extra
     total = wanted + extra
     STATE.stats["audio_engaged"] += 1
@@ -764,7 +764,7 @@ def _audio_latent_fps():
         return _AUDIO_LATENT_FPS_FALLBACK
 
 
-def _audio_extension(native_latents, cached_latents):
+def _audio_extension(native_latents, cached_latents, pipeline=None):
     """How many audio latents to carry beyond what the native encode produced.
 
     Wan2GP sizes the audio condition from the video overlap - `overlap_samples =
@@ -781,6 +781,29 @@ def _audio_extension(native_latents, cached_latents):
     engaged and fix_coords is on - hence the gate here.
     """
     if CONFIG.audio_context <= 0:
+        return 0
+    if getattr(pipeline, "reference_mode", False):
+        # Ref2VA.  build_ref2va_packed_sequence lays the reference tokens on the
+        # time axis *below* the history, advancing a cursor from float(text_len)
+        # to time_cursor (packing.py:236-263), and only then places the history
+        # block at history_time = time_cursor and the target at
+        # time_cursor + _reference_t_span (271, 268).
+        #
+        # The block translation is unaffected by that: both derive from the same
+        # cursor, so the discrepancy it corrects is invariant to where the cursor
+        # ended up.  The extension is not.  It works by moving everything except
+        # the audio history later by `extra`, which opens a gap of `extra` below
+        # the history for the longer audio tail to occupy.  On FL2VA that gap is
+        # vacant.  On Ref2VA the reference tokens were sitting there and move up
+        # by `extra` along with everything else, so they land exactly on top of
+        # the tail the gap was opened for.
+        #
+        # Fixing that means holding the reference rows still while the rest
+        # moves, which is a layout change this plugin has no way to validate
+        # yet.  Until then, Ref2VA gets the native audio window.
+        _log("extended audio context is not applied on Ref2VA: the reference "
+             "tokens occupy the time the longer tail would need; using the "
+             "native audio window")
         return 0
     if not CONFIG.video:
         # Worth naming: in audio-only mode there is no carried video block, so
@@ -1378,6 +1401,14 @@ def _patched_build_ref2va_packed_sequence(text_token_tags, references, num_laten
 
     if STATE.active_latents is None or not CONFIG.fix_coords:
         return sequence
+    if references and STATE.audio_extra:
+        # Unreachable if the Ref2VA gate in _audio_extension did its job.  Said
+        # out loud rather than trusted, because the failure is silent: the extra
+        # audio latents would be given times the reference tokens also hold.
+        _log(f"ERROR: {len(list(references))} reference(s) present with "
+             f"{STATE.audio_extra} extra audio latents carried; the extended "
+             f"audio tail and the references now share time coordinates. "
+             f"Set SWL_AUDIO_CONTEXT=0 and please report this.")
     return _apply_origin_shift(
         sequence, int(text_token_tags.shape[0]), keyframe_anchors, audio_condition_anchors,
         _rows_per_frame(latent_height, latent_width, patch_size, target_spatial_context),

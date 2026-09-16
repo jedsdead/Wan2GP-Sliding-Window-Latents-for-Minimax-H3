@@ -45,6 +45,14 @@
   refused: it arrives as a `"frame"` anchor positioned relative to
   `target_origin`, while the correction moves the carried block relative to the
   same origin, so the two cannot interact. Documented under *End images*.
+- `SWL_AUDIO_CONTEXT` is now refused in Ref2VA (reference) mode. The extension
+  opens a gap of `extra` below the history by moving everything else later; on
+  FL2VA that gap is vacant, but `build_ref2va_packed_sequence` puts the
+  reference tokens there and they move up with everything else, landing on the
+  tail the gap was opened for. Checked against MiniMax H3 RefMods, which
+  guarantees references exist, but it applies to native Ref2VA references too.
+  The block translation is *not* gated: it is invariant to the reference cursor,
+  since `history_time` and `target_origin` both derive from it.
 - Added `tests/test_carry_modes.py`, which loads `patches.py` against stubbed
   Wan2GP modules and exercises both paths.
 

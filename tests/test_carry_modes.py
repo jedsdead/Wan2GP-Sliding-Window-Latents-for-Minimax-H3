@@ -344,6 +344,64 @@ plan = patches._plan_window(None, (), window(
 check("a native injection at that position carries normally",
       plan.get("carry_blocked") is None and plan.get("usable"))
 
+# --------------------------------------------------------------------------
+# 4. Ref2VA and extended audio context
+# --------------------------------------------------------------------------
+
+print("\nextended audio context on Ref2VA")
+
+
+class FakePipeline:
+    def __init__(self, reference_mode):
+        self.reference_mode = reference_mode
+
+
+patches.CONFIG.audio_context = 2.0
+patches.CONFIG.video = True
+patches.CONFIG.fix_coords = True
+patches.STATE.active_latents = object()
+
+check("FL2VA still extends",
+      patches._audio_extension(30, 192, FakePipeline(False)) > 0)
+check("Ref2VA does not extend",
+      patches._audio_extension(30, 192, FakePipeline(True)) == 0,
+      "reference tokens hold the time the longer tail would need")
+check("a pipeline that does not report the mode is treated as FL2VA",
+      patches._audio_extension(30, 192, None) > 0,
+      "reference_mode is absent on FL2VA, so the default must not refuse")
+
+# The block translation must NOT be gated the same way: it is invariant to the
+# reference cursor.  packing.py places the Ref2VA history at
+# history_time = time_cursor and the target at time_cursor + _reference_t_span,
+# so both move together and the gap the correction closes never changes.
+FPT, RESCALE = (1, 4, 4, 4, 4), 5.0 / 3.0
+
+
+def video_t_grid(length, origin):
+    times, accumulated = [origin], 0.0
+    for index in range(length - 1):
+        accumulated += RESCALE * FPT[index % 5]
+        times.append(origin + accumulated)
+    return times
+
+
+def reference_t_span(length):
+    return sum(RESCALE * FPT[index % 5] for index in range(length))
+
+
+gaps = set()
+for carried in (7, 12, 17):
+    for cursor in (0.0, 512.0, 512.0 + 37.0 / 3):     # text_len, then refs moved it
+        block_end = video_t_grid(carried, cursor)[-1]
+        origin = cursor + reference_t_span(carried)
+        gaps.add(round((origin - block_end) / RESCALE, 6))
+check("the gap the correction closes is invariant to the reference cursor",
+      len(gaps) == 1, f"{gaps.pop()} frames for every carried count and cursor")
+
+patches.CONFIG.audio_context = 0.0
+patches.STATE.active_latents = None
+
+
 # _take_cached must actually honour it, not merely record it.
 patches.STATE.plan = anchor
 latents, reason = patches._take_cached(None)

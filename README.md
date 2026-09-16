@@ -724,6 +724,58 @@ commit `5c8b4ac` anyway, and its colour matching is pixel-domain and
 incompatible with carrying. What the guard adds is that the join no longer
 breaks silently when both are on.
 
+## MiniMax H3 RefMods
+
+Compatible. RefMods patch `_add_image_reference`, `_add_video_reference` and
+`generate`; this plugin patches `generate`, `_add_video_history`, `decode`,
+`_encode_audio`, `audio_decode` and the two sequence builders. The only shared
+target is `generate`, and both wrap rather than replace, so they compose.
+
+The coordinate correction is unaffected by references.
+`build_ref2va_packed_sequence` advances a time cursor across the reference
+tokens from `float(text_len)` to `time_cursor` (`packing.py:236-263`), then
+places the history block at `history_time = time_cursor` and the target at
+`time_cursor + _reference_t_span(history_frames)` (271, 268). Both derive from
+the same cursor, so the gap the correction closes is exactly 4 pixel frames
+whatever the references did to it — `tests/test_carry_modes.py` checks that for
+every supported carried count against three different cursors.
+
+Row arithmetic holds too. In the Ref2VA layout the keyframe rows start at
+`text_len` and the keyframe audio rows follow immediately at
+`keyframe_audio_start`, *before* the reference rows, which is exactly where
+`_apply_origin_shift` looks for them.
+
+### One exception: `SWL_AUDIO_CONTEXT` is off on Ref2VA
+
+Extended audio context works by moving everything except the audio history later
+by `extra`, opening a gap of `extra` below the history for the longer tail. On
+FL2VA that gap is vacant. On Ref2VA the reference tokens were sitting there and
+move up by `extra` with everything else, landing on top of the tail the gap was
+opened for.
+
+So `SWL_AUDIO_CONTEXT` is refused in reference mode, with a log line saying so.
+Everything else — the video carry, the audio carry, the coordinate correction,
+colour consistency — is unchanged. This is not specific to RefMods: it applies
+to native Ref2VA reference images too. RefMods only make it certain to come up.
+
+Fixing it properly means holding the reference rows still while the rest moves.
+That is a tractable change and the row ranges are available in the builder, but
+it is new layout work and `SWL_AUDIO_CONTEXT` has no hardware validation yet, so
+it is left gated.
+
+### Two things to know
+
+RefMod **extraction** runs inside `generate()` and returns without generating.
+If this plugin's `generate` wrapper is the outer one, it will have planned a
+window that never decodes, so the next real window falls back to re-encoding
+once. Harmless, and it only arises if you extract mid-run.
+
+Extraction also calls the pipeline's own `_encode_audio` for audio mods, which
+goes through this plugin's patch. The substitution is guarded by a waveform
+fingerprint, a continuation check and a window-continuity check, so a RefMod
+waveform is not replaced — but don't extract audio mods in the middle of a
+sliding-window run.
+
 ## Sliding Window Anchor
 
 Use this plugin or the Sliding Window Anchor plugin, not both — running them
