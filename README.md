@@ -4,7 +4,8 @@ A Wan2GP (WanGP) extension plugin that carries MiniMax H3 latents across
 sliding windows instead of re-encoding the previous window's decoded pixels,
 removing one VAE decode/encode round trip per window.
 
-Version 1.1 · MIT · built and verified against Wan2GP `362c346` (7 Sep 2026)
+Version 1.2.4 · MIT · built against Wan2GP `362c346` (7 Sep 2026), updated for
+the uint8 VAE decode in `ec9566a` (6 Oct 2026)
 
 Video and audio latent carry are on by default. Colour consistency is
 experimental and off by default. Do not run this alongside the Sliding Window

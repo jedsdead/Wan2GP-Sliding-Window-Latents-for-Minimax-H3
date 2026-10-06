@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.2.4
+- Fixed `TypeError: _patched_decode() takes 2 positional arguments but 3 were
+  given` on Wan2GP `ec9566a` and later. The H3 VAE `decode` now takes
+  `uint8_rounding`, which the pipeline passes positionally. The video and audio
+  decode wrappers now forward `*args, **kwargs` untouched, so a future
+  parameter will not break them the same way.
+- Handled the uint8 frames that decode now returns for video renders
+  (0-255 instead of signed float -1 to 1). Colour correction in `both` scope
+  converted them as if they were signed. Once the signature crash was fixed,
+  that would have clamped every corrected window to near black. `_correct_pixels`
+  now converts by dtype, rounding and clamping to 0-255 for uint8. Float output,
+  which image and refinement paths still use, follows the previous path.
+- `_colour_stats` picks the conversion from the frame dtype rather than sniffing
+  the pooled values, so a near-black uint8 window is no longer misread as
+  already being unit range.
+
 ## 1.2.2
 - `SWL_AUDIO_CONTEXT` now works on Ref2VA. 1.2.1 refused it there because the
   extension moved the reference tokens later along with everything else, walking

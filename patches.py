@@ -357,7 +357,7 @@ class _State:
 
 STATE = _State()
 
-VERSION = "1.2.2"
+VERSION = "1.2.4"
 
 _PACKING = None                     # packing module, resolved by _preflight()
 
@@ -382,7 +382,10 @@ def _colour_stats(decoded, start, stop):
         return None
     pooled = torch.nn.functional.adaptive_avg_pool2d(
         frames.permute(1, 0, 2, 3).float(), (_COLOUR_POOL, _COLOUR_POOL))
-    unit = _to_unit(pooled).permute(0, 2, 3, 1).cpu().numpy()
+    # Decide the range from the dtype, not by sniffing the pooled values: a
+    # near-black uint8 window would otherwise be mistaken for unit range.
+    unit = (pooled.div(255.0) if frames.dtype == torch.uint8
+            else _to_unit(pooled)).permute(0, 2, 3, 1).cpu().numpy()
     return colour.ycbcr_stats(unit)
 
 
@@ -440,14 +443,20 @@ def _correct_pixels(decoded, gain, offset):
     except Exception:
         in_place = False
     out = decoded if in_place else decoded.clone()
+    is_uint8 = out.dtype == torch.uint8
 
     total = out.shape[2]
     step = max(1, _COLOUR_CHUNK // max(1, out.shape[-1] * out.shape[-2]))
     for start in range(0, total, step):
         block = out[:, :, start:start + step].float()
-        unit = block.add(1.0).mul_(0.5)
+        # Newer Wan2GP decodes straight to uint8 [0, 255]; older (and image /
+        # refinement paths) still hand back signed float [-1, 1].
+        unit = block.div_(255.0) if is_uint8 else block.add_(1.0).mul_(0.5)
         moved = torch.einsum("rk,bkthw->brthw", matrix, unit) + shift.view(1, -1, 1, 1, 1)
-        moved = moved.mul_(2.0).sub_(1.0).clamp_(-1.0, 1.0)
+        if is_uint8:
+            moved = moved.mul_(255.0).round_().clamp_(0.0, 255.0)
+        else:
+            moved = moved.mul_(2.0).sub_(1.0).clamp_(-1.0, 1.0)
         out[:, :, start:start + step] = moved.to(out.dtype)
     return out
 
@@ -605,8 +614,11 @@ def _check_alignment(signatures, signature, incoming):
     return True, None
 
 
-def _patched_decode(self, latents):
-    decoded = _ORIGINALS["decode"](self, latents)
+def _patched_decode(self, latents, *args, **kwargs):
+    # Forward everything: Wan2GP now passes uint8_rounding positionally, and
+    # may add more parameters later.  The result can then be uint8 [0, 255]
+    # rather than float [-1, 1]; every consumer below handles both.
+    decoded = _ORIGINALS["decode"](self, latents, *args, **kwargs)
     STATE.colour_step = None
     if CONFIG.colour:
         try:
@@ -660,8 +672,8 @@ def _patched_decode(self, latents):
     return decoded
 
 
-def _patched_audio_decode(self, latents):
-    waveform = _ORIGINALS["audio_decode"](self, latents)
+def _patched_audio_decode(self, latents, *args, **kwargs):
+    waveform = _ORIGINALS["audio_decode"](self, latents, *args, **kwargs)
     try:
         tail = latents[..., -_MAX_CACHED_AUDIO_LATENTS:].detach().to(torch.float32).cpu()
         with STATE.lock:
