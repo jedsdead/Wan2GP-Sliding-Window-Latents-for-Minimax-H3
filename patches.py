@@ -357,7 +357,7 @@ class _State:
 
 STATE = _State()
 
-VERSION = "1.2.4"
+VERSION = "1.2.5"
 
 _PACKING = None                     # packing module, resolved by _preflight()
 
@@ -438,7 +438,10 @@ def _correct_pixels(decoded, gain, offset):
 
     try:
         probe = decoded[:, :, :1]
-        probe.mul_(1.0)
+        # Integer 1, not 1.0: a float scalar cannot be written back into a
+        # uint8 tensor in place, which made the probe fail on every uint8
+        # window and fall back to cloning the whole video.
+        probe.mul_(1)
         in_place = True
     except Exception:
         in_place = False
@@ -451,7 +454,8 @@ def _correct_pixels(decoded, gain, offset):
         block = out[:, :, start:start + step].float()
         # Newer Wan2GP decodes straight to uint8 [0, 255]; older (and image /
         # refinement paths) still hand back signed float [-1, 1].
-        unit = block.div_(255.0) if is_uint8 else block.add_(1.0).mul_(0.5)
+        # Out of place: on a float32 window .float() returns `out` itself.
+        unit = block.div(255.0) if is_uint8 else block.add(1.0).mul_(0.5)
         moved = torch.einsum("rk,bkthw->brthw", matrix, unit) + shift.view(1, -1, 1, 1, 1)
         if is_uint8:
             moved = moved.mul_(255.0).round_().clamp_(0.0, 255.0)
@@ -1034,6 +1038,16 @@ def _plan_window(pipeline, args, kwargs):
         return refuse("generate() did not report window_no, so job boundaries "
                       "cannot be established")
 
+    # generate() normalises frame_num before anything else (pipeline.py, the
+    # `normalize_frame_count(int(frame_num), 5, 17, 5)` line).
+    frame_num = normalize_frame_count(int(values.get("frame_num") or 0), 5, _CLIP_LENGTH, 5)
+
+    # ControlNet checkpoints continue through control anchors instead: generate()
+    # zeroes continuation_count, so there is no history block, no continuation
+    # audio encode, and every frame_num frame is a target frame.
+    control = (bool(getattr(getattr(pipeline, "transformer", None), "control_layers", None))
+               and not values.get("refinement_mode"))
+
     prefix, overlap_error = normalize_overlap(int(values.get("prefix_frames_count") or 0), _CLIP_LENGTH, 1)
     if overlap_error:
         return refuse("invalid overlap")
@@ -1043,9 +1057,11 @@ def _plan_window(pipeline, args, kwargs):
     count = min(prefix, continuation.shape[1]) if continuation is not None and values.get("image_start") is None else 0
     if count and count < prefix:
         count = floor_frame_count(count, 1, _CLIP_LENGTH, 1)
+    if control:
+        count = 0
     history_count = continuation[:, -count:-1].shape[1] if count > 1 else 0
 
-    target_frames = int(values.get("frame_num") or 0) - history_count
+    target_frames = frame_num - history_count
     if target_frames <= 0:
         return refuse("no target frames")
     aligned = normalize_frame_count(target_frames, 5, _CLIP_LENGTH, 5)

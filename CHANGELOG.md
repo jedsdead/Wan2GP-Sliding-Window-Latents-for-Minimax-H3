@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.2.4
+## 1.2.5
 - Fixed `TypeError: _patched_decode() takes 2 positional arguments but 3 were
   given` on Wan2GP `ec9566a` and later. The H3 VAE `decode` now takes
   `uint8_rounding`, which the pipeline passes positionally. The video and audio
@@ -15,6 +15,18 @@
 - `_colour_stats` picks the conversion from the frame dtype rather than sniffing
   the pooled values, so a near-black uint8 window is no longer misread as
   already being unit range.
+- The in-place probe in `_correct_pixels` multiplied by `1.0`, which cannot be
+  written back into a uint8 tensor. It failed on every uint8 window, so the
+  correction cloned the whole video instead of working in place. It now
+  multiplies by `1`, which works for both dtypes.
+- The window plan now mirrors two things `generate()` does before it counts
+  frames. It normalises `frame_num` first, and on ControlNet checkpoints it
+  drops the history block (continuation goes through control anchors). Without
+  the first, an unaligned `frame_num` made the plan disagree with the real
+  latent count, so the next window refused the cache. Without the second, the
+  plan reported continuation audio that ControlNet windows never encode, so
+  the first audio encode of the window (the control target's audio condition)
+  was eligible for substitution.
 
 ## 1.2.2
 - `SWL_AUDIO_CONTEXT` now works on Ref2VA. 1.2.1 refused it there because the
